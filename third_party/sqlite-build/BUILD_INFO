@@ -1,0 +1,48 @@
+source:     https://github.com/sqlite/sqlite (branch: begin-concurrent)
+commit:     71f1e0e7384acdd2f80814a52df5f68cc4b99f33
+version:    "3.55.0"
+built:      2026-11-05T12:02:32Z
+builder:    cc (Debian 14.2.0-19) 14.2.0
+
+configure:  ./configure && make sqlite3.c   (sqlite autosetup; requires tclsh)
+
+compile flags:
+  -O3 -fPIC -pthread
+  -DSQLITE_CORE
+  -DSQLITE_THREADSAFE=1
+  -DSQLITE_DEFAULT_FOREIGN_KEYS=1
+  -DSQLITE_DEFAULT_MEMSTATUS=0
+  -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1
+  -DSQLITE_ENABLE_API_ARMOR
+  -DSQLITE_ENABLE_COLUMN_METADATA
+  -DSQLITE_ENABLE_DBSTAT_VTAB
+  -DSQLITE_ENABLE_DESERIALIZE
+  -DSQLITE_ENABLE_FTS3
+  -DSQLITE_ENABLE_FTS3_PARENTHESIS
+  -DSQLITE_ENABLE_FTS5
+  -DSQLITE_ENABLE_GEOPOLY
+  -DSQLITE_ENABLE_LOAD_EXTENSION=1
+  -DSQLITE_ENABLE_MATH_FUNCTIONS
+  -DSQLITE_ENABLE_RTREE
+  -DSQLITE_ENABLE_STAT4
+  -DSQLITE_ENABLE_UNLOCK_NOTIFY
+  -DSQLITE_SOUNDEX
+  -DSQLITE_LIKE_DOESNT_MATCH_BLOBS
+  -DSQLITE_USE_URI
+  -DSQLITE_MAX_EXPR_DEPTH=10000
+  -DHAVE_USLEEP=1
+  -DHAVE_ISNAN
+
+outputs:
+  include/sqlite3.h, include/sqlite3ext.h
+  lib/libsqlite3.a              (static; linked into the service binary)
+  lib/pkgconfig/sqlite3.pc      (found via SQLITE3_LIB_DIR by libsqlite3-sys)
+
+notes:
+  - The begin-concurrent branch allows multiple concurrent writers in WAL mode
+    via optimistic page-level locking (SQLITE_BUSY_SNAPSHOT on conflict).
+    See third_party/sqlite/doc/begin_concurrent.md
+  - sqlx links this build through .cargo/config.toml env vars
+    (LIBSQLITE3_SYS_USE_PKG_CONFIG=1, SQLITE3_LIB_DIR, SQLITE3_STATIC=1).
+  - Rebuild with scripts/build-sqlite.sh. Override SQLITE_GIT_REF to pin
+    another ref.

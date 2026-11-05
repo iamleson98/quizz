@@ -1,0 +1,17 @@
+# Link sqlx's libsqlite3-sys against OUR SQLite build (begin-concurrent branch,
+# 3.55.0) instead of the system library or libsqlite3-sys's bundled 3.46.0.
+#
+#  * LIBSQLITE3_SYS_USE_PKG_CONFIG=1 forces libsqlite3-sys into its
+#    `build_linked` path (SQLITE3_LIB_DIR would otherwise be ignored because
+#    sqlx enables the `bundled` feature).
+#  * SQLITE3_LIB_DIR / SQLITE3_INCLUDE_DIR point at our prebuilt static
+#    library and headers (see third_party/sqlite-build/BUILD_INFO).
+#  * SQLITE3_STATIC=1 makes the linker prefer libsqlite3.a (fully static,
+#    no runtime .so dependency).
+#
+# `relative = true` resolves against the parent of this .cargo directory.
+[env]
+LIBSQLITE3_SYS_USE_PKG_CONFIG = "1"
+SQLITE3_STATIC = "1"
+SQLITE3_LIB_DIR = { value = "third_party/sqlite-build/lib", relative = true }
+SQLITE3_INCLUDE_DIR = { value = "third_party/sqlite-build/include", relative = true }

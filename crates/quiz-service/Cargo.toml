@@ -1,0 +1,42 @@
+[package]
+name = "quiz-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argon2 = "0.6.0"
+async-graphql = { version = "7.2.1", features = ["tracing"] }
+async-graphql-axum = "7.2.1"
+axum = "0.8.9"
+futures = "0.3.34"
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+opentelemetry = "0.33.1"
+opentelemetry-otlp = { version = "0.33.1", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio"] }
+rand = "0.10.3"
+serde.workspace = true
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+    "migrate",
+    "macros",
+] }
+thiserror.workspace = true
+tokio = { workspace = true }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tower-http = { version = "0.7.1", features = [
+    "compression-gzip",
+    "timeout",
+    "limit",
+] }
+tracing.workspace = true
+tracing-opentelemetry = "0.34.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }

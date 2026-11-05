@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Prebuilt sandbox binaries (rebuild with cargo build / scripts)
+/bin/
+
+# Local databases
+*.db
+*.db-wal
+*.db-shm
+
+# Custom SQLite build (reproduce with scripts/build-sqlite.sh;
+# the prebuilt artifacts are committed intentionally so `cargo build`
+# works offline, but feel free to exclude them in forks)
+/third_party/sqlite/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
