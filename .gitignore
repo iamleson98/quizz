@@ -10,6 +10,11 @@
 *.db-wal
 *.db-shm
 
+# Load-test runtime state
+loadtest/state.json
+loadtest/*.log
+loadtest/server*.pid
+
 # Custom SQLite build (reproduce with scripts/build-sqlite.sh;
 # the prebuilt artifacts are committed intentionally so `cargo build`
 # works offline, but feel free to exclude them in forks)
