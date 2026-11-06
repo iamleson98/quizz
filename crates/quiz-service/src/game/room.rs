@@ -34,6 +34,9 @@ pub const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 pub const IDLE_LIMIT: Duration = Duration::from_secs(60 * 60);
 /// Frames a socket may have waiting before it is cut as too slow.
 pub const OUT_QUEUE: usize = 8;
+/// The beat between a question closing and its reveal (the correct options
+/// and the ranking), in milliseconds. The host's `next` skips it.
+pub const REVEAL_DELAY_MS: u64 = 2500;
 /// Rows of the host's provisional ranking.
 pub const PROVISIONAL_TOP: usize = 10;
 /// How many commands may wait for the room.
@@ -127,6 +130,8 @@ impl Drop for Sock {
 enum Phase {
     Lobby,
     Question,
+    /// The question is closed; the reveal comes at `reveal_at`.
+    Closing,
     Reveal,
     Podium,
 }
@@ -178,6 +183,8 @@ struct Game {
     qi: usize,
     q_started: Instant,
     q_deadline: Instant,
+    /// When a closed question is revealed (Closing only).
+    reveal_at: Instant,
     players: Vec<Player>,
     by_user: HashMap<String, usize>,
     active_count: usize,
@@ -331,6 +338,7 @@ impl Room {
         [
             g.filter(|g| g.phase == Phase::Question)
                 .map(|g| g.q_deadline),
+            g.filter(|g| g.phase == Phase::Closing).map(|g| g.reveal_at),
             g.map(|g| g.rc_at),
             g.map(|g| g.idle_at),
             self.flush_at,
@@ -349,6 +357,13 @@ impl Room {
             .is_some_and(|g| g.phase == Phase::Question && now >= g.q_deadline)
         {
             self.close_question().await;
+        }
+        if self
+            .game
+            .as_ref()
+            .is_some_and(|g| g.phase == Phase::Closing && now >= g.reveal_at)
+        {
+            self.reveal_question().await;
         }
         if self.flush_at.is_some_and(|t| now >= t) {
             self.flush();
@@ -638,6 +653,7 @@ impl Room {
             qi: 0,
             q_started: now,
             q_deadline: now,
+            reveal_at: now,
             players: Vec::new(),
             by_user: HashMap::new(),
             active_count: 0,
@@ -688,7 +704,7 @@ impl Room {
 fn join(g: &mut Game, user: &str, name: &str, wall: i64) -> AppResult<usize> {
     let first = match g.phase {
         Phase::Lobby => 0,
-        Phase::Question | Phase::Reveal => g.qi + 1,
+        Phase::Question | Phase::Closing | Phase::Reveal => g.qi + 1,
         Phase::Podium => g.questions.len(),
     };
     if let Some(&pid) = g.by_user.get(user) {
@@ -770,6 +786,7 @@ impl Room {
                     None => Out::Plain(frames::close(head)),
                 }
             }
+            Phase::Closing => Out::Plain(frames::closed(g.qi + 1)),
             Phase::Reveal => match (&g.reveal, player) {
                 (Some(head), Some(p)) => Out::Open(head.clone(), reveal_tail(p)),
                 (Some(head), None) => Out::Plain(close_shared(head)),
@@ -887,6 +904,7 @@ impl Room {
         match phase {
             Phase::Lobby => self.open_question(0),
             Phase::Question => self.close_question().await,
+            Phase::Closing => self.reveal_question().await,
             Phase::Reveal if qi + 1 < total => self.open_question(qi + 1),
             Phase::Reveal => self.open_podium(),
             Phase::Podium => self.finish(EndReason::Host).await,
@@ -994,12 +1012,25 @@ impl Room {
         Ok(())
     }
 
-    /// Close the open question: score the answers, rank the players, send
-    /// the reveal and write the answers in one transaction.
+    /// Close the open question: lock it, tell everyone with a tiny frame, and
+    /// leave the reveal for a beat later (or the host's `next`).
     async fn close_question(&mut self) {
-        let started = std::time::Instant::now();
         let Some(g) = &mut self.game else { return };
         if g.phase != Phase::Question {
+            return;
+        }
+        g.phase = Phase::Closing;
+        g.reveal_at = Instant::now() + Duration::from_millis(REVEAL_DELAY_MS);
+        let frame = frames::closed(g.qi + 1);
+        self.broadcast_shared(frame);
+    }
+
+    /// Reveal a closed question: score the answers, rank the players, send
+    /// the reveal and write the answers in one transaction.
+    async fn reveal_question(&mut self) {
+        let started = std::time::Instant::now();
+        let Some(g) = &mut self.game else { return };
+        if g.phase != Phase::Closing {
             return;
         }
         g.phase = Phase::Reveal;
@@ -1093,6 +1124,14 @@ impl Room {
     async fn finish(&mut self, reason: EndReason) {
         if self.game.is_none() {
             return;
+        }
+        if self
+            .game
+            .as_ref()
+            .is_some_and(|g| g.phase == Phase::Closing)
+        {
+            // the answers of a closed question are scored before the end
+            self.reveal_question().await;
         }
         let ended_at = self.now_wall();
         self.persist(Some(ended_at)).await;

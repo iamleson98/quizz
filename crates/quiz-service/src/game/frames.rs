@@ -32,6 +32,7 @@ pub mod server {
     pub const ERROR: u8 = 8;
     pub const ACK: u8 = 9;
     pub const NAMES: u8 = 10;
+    pub const CLOSED: u8 = 11;
 }
 
 /// Why a game ended (`ended` frame).
@@ -290,6 +291,11 @@ pub fn error(code: u8, request: u64) -> Utf8Bytes {
     Utf8Bytes::from(format!("[{},{code},{request}]", server::ERROR))
 }
 
+/// `[11,q]`: question `q` is closed; the reveal follows after a short beat.
+pub fn closed(q: usize) -> Utf8Bytes {
+    Utf8Bytes::from(format!("[{},{q}]", server::CLOSED))
+}
+
 /// `[9]`: the answer is locked in.
 pub fn ack() -> Utf8Bytes {
     Utf8Bytes::from_static("[9]")
@@ -383,6 +389,11 @@ mod tests {
                 200
             ])
         );
+    }
+
+    #[test]
+    fn the_closed_frame_is_tiny() {
+        assert_eq!(&*closed(3), "[11,3]");
     }
 
     #[test]

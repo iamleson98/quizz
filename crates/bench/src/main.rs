@@ -119,6 +119,7 @@ struct Player {
     /// Micros since the bench started, per question; UNSET until it happens.
     question_at: Vec<AtomicU64>,
     answered_at: Vec<AtomicU64>,
+    closed_at: Vec<AtomicU64>,
     reveal_at: Vec<AtomicU64>,
     lobby: AtomicU64,
     sample: std::sync::Mutex<Vec<String>>,
@@ -284,6 +285,12 @@ async fn player_task(shared: Arc<Shared>, idx: usize, mut ws: Ws, spread_ms: u64
                     break;
                 }
             }
+            Some(11) => {
+                let q = frame[1].as_u64().unwrap_or(1) as usize;
+                if q >= 1 && q <= me.closed_at.len() {
+                    me.closed_at[q - 1].store(shared.micros(), Ordering::Relaxed);
+                }
+            }
             Some(5) => {
                 let q = frame[1].as_u64().unwrap_or(1) as usize;
                 if q >= 1 && q <= me.reveal_at.len() {
@@ -417,6 +424,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         frames_out: AtomicU64::new(0),
         question_at: (0..q).map(|_| AtomicU64::new(UNSET)).collect(),
         answered_at: (0..q).map(|_| AtomicU64::new(UNSET)).collect(),
+        closed_at: (0..q).map(|_| AtomicU64::new(UNSET)).collect(),
         reveal_at: (0..q).map(|_| AtomicU64::new(UNSET)).collect(),
         lobby: AtomicU64::new(UNSET),
         sample: Default::default(),
@@ -531,7 +539,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 p.answered_at[qi].load(Ordering::Relaxed) != UNSET
             })
             .await?;
-        // everyone answered: the service closes the question by itself
+        // everyone answered: the service closes the question by itself and
+        // says so with a tiny frame; the host skips the beat before the reveal
+        shared
+            .wait("the closed frame", |p| {
+                p.closed_at[qi].load(Ordering::Relaxed) != UNSET
+            })
+            .await?;
+        for host in &mut hosts {
+            host.send(Message::text(json!([2]).to_string())).await?;
+        }
         shared
             .wait("the reveal", |p| {
                 p.reveal_at[qi].load(Ordering::Relaxed) != UNSET
@@ -546,7 +563,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let last_reveal = shared
             .players
             .iter()
-            .map(|p| p.reveal_at[qi].load(Ordering::Relaxed))
+            .map(|p| p.closed_at[qi].load(Ordering::Relaxed))
             .max()
             .unwrap_or(0);
         let mut reach: Vec<u64> = shared
@@ -628,7 +645,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         mean(&|r| r.bytes_out)
     );
     println!(
-        "  frames received                 : {:.2}   (question, ack, reveal)",
+        "  frames received                 : {:.2}   (question, ack, closed, reveal)",
         mean(&|r| r.frames_in)
     );
     println!("whole class reached after a question opens:");
@@ -639,7 +656,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         worst_reach as f64 / 1000.0
     );
     println!(
-        "question closed after the last answer: slowest {:.1} ms (all players saw the reveal)",
+        "question closed after the last answer: slowest {:.1} ms (every player had the closed frame)",
         close_worst as f64 / 1000.0
     );
 

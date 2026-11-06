@@ -2,6 +2,7 @@
 
 use super::frames::{ClientFrame, Out};
 use super::registry::{Deps, Rooms};
+use super::room::REVEAL_DELAY_MS;
 use super::room::{Member, RoomHandle};
 use super::store::{GameStore, LoadedQuiz};
 use crate::auth::Role;
@@ -137,6 +138,11 @@ async fn adv(d: Duration) {
     settle().await;
 }
 
+/// Wait out the beat between a question closing and its reveal.
+async fn beat() {
+    adv(Duration::from_millis(REVEAL_DELAY_MS + 100)).await;
+}
+
 /// Let every task run: advances a millisecond of virtual time.
 async fn settle() {
     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -245,7 +251,15 @@ async fn a_whole_game_scores_ranks_and_ends() {
     answer(&p2, 1, 0b0001).await;
     settle().await;
 
-    // everyone answered: the question closed by itself, before its deadline
+    // everyone answered: the question closed by itself, before its deadline,
+    // and everybody is told at once with a tiny frame; no answer, no ranking
+    // yet
+    for c in [&mut p1, &mut p2, &mut h] {
+        let f = c.frames();
+        assert_eq!(last_of(&f, 11).unwrap(), &json!([11, 1]));
+        assert!(last_of(&f, 5).is_none(), "the reveal waits for the beat");
+    }
+    beat().await;
     let f1 = p1.frames();
     let reveal = last_of(&f1, 5).expect("reveal frame");
     assert_eq!(reveal[1], json!(1));
@@ -301,6 +315,7 @@ async fn a_whole_game_scores_ranks_and_ends() {
     answer(&p1, 2, 0b0001).await;
     answer(&p2, 2, 0b0101).await;
     settle().await;
+    beat().await;
     let f1 = p1.frames();
     let reveal = last_of(&f1, 5).unwrap();
     // half credit at 0 s: 1000 x 0.5
@@ -313,9 +328,10 @@ async fn a_whole_game_scores_ranks_and_ends() {
     adv(Duration::from_secs(10)).await;
     settle().await;
     assert!(
-        last_of(&p1.frames(), 5).is_some(),
+        last_of(&p1.frames(), 11).is_some(),
         "the deadline closed the question"
     );
+    beat().await;
 
     // podium, then the end
     h.send(ClientFrame::Next).await;
@@ -353,16 +369,22 @@ async fn the_deadline_closes_a_question_and_the_host_can_close_early() {
     settle().await;
     p.frames();
     adv(Duration::from_secs(19)).await;
-    assert!(last_of(&p.frames(), 5).is_none(), "not yet");
+    assert!(last_of(&p.frames(), 11).is_none(), "not yet");
     adv(Duration::from_secs(2)).await;
-    assert!(last_of(&p.frames(), 5).is_some(), "closed at 20 s");
+    let f = p.frames();
+    assert_eq!(last_of(&f, 11).unwrap(), &json!([11, 1]), "closed at 20 s");
+    assert!(last_of(&f, 5).is_none());
+    beat().await;
+    assert!(last_of(&p.frames(), 5).is_some(), "revealed after the beat");
 
     h.send(ClientFrame::Next).await;
     settle().await;
     p.frames();
     h.send(ClientFrame::Next).await; // the host closes question 2 at once
     settle().await;
-    assert!(last_of(&p.frames(), 5).is_some());
+    let f = p.frames();
+    assert!(last_of(&f, 11).is_some(), "closed at once");
+    assert!(last_of(&f, 5).is_none(), "but not revealed yet");
     h.frames();
 }
 
@@ -390,6 +412,7 @@ async fn a_late_joiner_watches_and_scores_from_the_next_question() {
     answer(&p1, 1, 0b0010).await;
     settle().await;
     // p1 was the only eligible player: the question closed
+    beat().await;
     let f = late.frames();
     let reveal = last_of(&f, 5).unwrap();
     assert_eq!(reveal[6], json!(0));
@@ -604,6 +627,7 @@ async fn a_failed_write_is_retried_with_the_next_one() {
     *w.store.fail_writes.lock().unwrap() = true;
     answer(&p, 1, 0b0010).await;
     settle().await;
+    beat().await; // the reveal's write fails
     assert!(w.store.batches.lock().unwrap().is_empty());
     *w.store.fail_writes.lock().unwrap() = false;
     h.send(ClientFrame::End).await;
@@ -744,6 +768,7 @@ async fn not_answering_never_beats_a_wrong_answer_in_the_tie_break() {
     settle().await;
     h.send(ClientFrame::Next).await; // the host closes: the other never answered
     settle().await;
+    beat().await;
     let f = tried.frames();
     let reveal = last_of(&f, 5).unwrap();
     assert_eq!(
@@ -768,6 +793,7 @@ async fn the_host_sees_how_many_chose_each_option_live_and_players_do_not() {
     h.send(ClientFrame::Next).await; // question 1
     settle().await;
     h.send(ClientFrame::Next).await; // the host closes it
+    h.send(ClientFrame::Next).await; // ... and reveals it at once
     h.send(ClientFrame::Next).await; // question 2, multiple choice
     adv(Duration::from_millis(600)).await;
     h.frames();
@@ -889,7 +915,7 @@ async fn the_host_is_told_who_joined_incrementally_and_players_never_are() {
 /// `(points, right, streak, bonus)` from a player's reveal tail.
 fn result_of(frames: &[Value]) -> (i64, i64, i64, i64) {
     let r = last_of(frames, 5)
-        .expect("a reveal")
+        .unwrap_or_else(|| panic!("a reveal in {frames:?}"))
         .as_array()
         .unwrap()
         .clone();
@@ -918,6 +944,8 @@ async fn streaks_grow_and_reset_on_partial_wrong_or_missing_and_late_joiners_sta
         answer(p, 1, 0b0010).await;
     }
     settle().await;
+    beat().await;
+    h.frames();
     for p in [&mut a, &mut b, &mut c] {
         let (points, right, streak, bonus) = result_of(&p.frames());
         assert_eq!((right, streak, bonus), (1, 1, 0));
@@ -932,7 +960,9 @@ async fn streaks_grow_and_reset_on_partial_wrong_or_missing_and_late_joiners_sta
     answer(&b, 2, 0b0001).await;
     settle().await;
     h.send(ClientFrame::Next).await; // the host closes it; c never answered
+    h.send(ClientFrame::Next).await; // and reveals it at once
     settle().await;
+    h.frames();
     let (points, right, streak, bonus) = result_of(&a.frames());
     assert_eq!(
         (right, streak, bonus),
@@ -969,6 +999,7 @@ async fn streaks_grow_and_reset_on_partial_wrong_or_missing_and_late_joiners_sta
         answer(p, 3, 0b10).await;
     }
     settle().await;
+    beat().await;
     let (_, _, streak, bonus) = result_of(&a.frames());
     assert_eq!((streak, bonus), (3, 200));
     for p in [&mut b, &mut c, &mut late] {
@@ -1007,10 +1038,12 @@ async fn the_streak_survives_a_reconnect() {
     settle().await;
     let mut again = player(&w, 1).await;
     again.frames();
+    beat().await; // the reveal of question 1
     h.send(ClientFrame::Next).await;
     settle().await;
     answer(&again, 2, 0b0101).await;
     settle().await;
+    beat().await;
     let (_, right, streak, bonus) = result_of(&again.frames());
     assert_eq!(
         (right, streak, bonus),
@@ -1070,6 +1103,8 @@ async fn the_host_sees_a_provisional_ranking_that_the_close_makes_final() {
         seen_after_answer.push((i, rows_of(&last_progress(&f))));
         last_frames = f;
     }
+    beat().await;
+    last_frames.extend(h.frames());
     let after_p2 = &seen_after_answer[0].1;
     assert_eq!(after_p2[0].0, "name-p2", "the first right answer leads");
     assert!(after_p2[0].1 > 900, "{after_p2:?}");
@@ -1121,6 +1156,7 @@ async fn the_provisional_ranking_counts_the_streak_and_partial_credit_like_the_c
     answer(&a, 1, 0b0010).await;
     answer(&b, 1, 0b0010).await; // both right: the question closes
     settle().await;
+    beat().await;
     h.send(ClientFrame::Next).await; // question 2, multiple choice
     settle().await;
     adv(Duration::from_secs(2)).await;
@@ -1150,6 +1186,7 @@ async fn the_provisional_ranking_counts_the_streak_and_partial_credit_like_the_c
 
     // the close uses exactly these figures
     settle().await;
+    beat().await;
     let f = a.frames();
     let reveal = last_of(&f, 5).unwrap();
     assert_eq!(reveal[6].as_i64().unwrap(), first_total, "a's total");
@@ -1232,4 +1269,106 @@ async fn the_ranking_is_the_top_ten_only() {
     let f = h.frames();
     assert_eq!(rows_of(&last_progress(&f)).len(), 10);
     assert_eq!(rows_of(&last_progress(&f))[0].0, "name-p1");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_reveal_waits_for_the_beat_and_the_correct_answer_is_nowhere_before_it() {
+    let w = world();
+    let mut a = player(&w, 1).await;
+    let mut b = player(&w, 2).await;
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    adv(Duration::from_secs(1)).await;
+    answer(&a, 1, 0b0010).await;
+    answer(&b, 1, 0b0001).await;
+    settle().await;
+    // everyone answered: every socket gets the tiny closed frame at once...
+    let frames_at_close: Vec<Vec<Value>> = [&mut a, &mut b, &mut h]
+        .into_iter()
+        .map(|c| c.frames())
+        .collect();
+    for f in &frames_at_close {
+        assert_eq!(last_of(f, 11).unwrap(), &json!([11, 1]));
+        // ...and no frame carries a reveal (the correct options or a ranking)
+        assert!(f.iter().all(|f| kind(f) != 5 && kind(f) != 6), "{f:?}");
+    }
+    // a socket that arrives during the beat is told it is closed, nothing more
+    let mut late = player(&w, 3).await;
+    let f = late.frames();
+    assert_eq!(f.iter().filter(|f| kind(f) == 11).count(), 1);
+    assert!(f.iter().all(|f| kind(f) != 5), "{f:?}");
+    // answers during the beat are refused
+    answer(&late, 1, 0b0010).await;
+    settle().await;
+    assert_eq!(late.frames(), vec![json!([8, 5, 4])]);
+
+    // just before the beat is over: still nothing
+    adv(Duration::from_millis(REVEAL_DELAY_MS - 100)).await;
+    for c in [&mut a, &mut b, &mut h, &mut late] {
+        assert!(c.frames().iter().all(|f| kind(f) != 5));
+    }
+    // then every socket gets the reveal
+    adv(Duration::from_millis(200)).await;
+    for c in [&mut a, &mut b, &mut h, &mut late] {
+        let f = c.frames();
+        assert_eq!(f.iter().filter(|f| kind(f) == 5).count(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_hosts_next_during_the_beat_reveals_at_once_and_a_second_press_moves_on() {
+    let w = world();
+    let mut a = player(&w, 1).await;
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&a, 1, 0b0010).await; // the only player: the question closes
+    settle().await;
+    a.frames();
+    h.frames();
+
+    h.send(ClientFrame::Next).await; // during the beat
+    settle().await;
+    assert_eq!(
+        a.frames().iter().filter(|f| kind(f) == 5).count(),
+        1,
+        "revealed at once, without waiting for the beat"
+    );
+    assert!(last_of(&h.frames(), 5).is_some());
+
+    // the beat's timer later finds nothing to do: no second reveal
+    beat().await;
+    assert!(a.frames().iter().all(|f| kind(f) != 5));
+    assert_eq!(w.store.batches.lock().unwrap().len(), 1, "one write");
+
+    // a press after the reveal moves on, as before
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    let f = a.frames();
+    assert_eq!(last_of(&f, 2).unwrap()[2], json!(2));
+    h.frames();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_host_keeps_seeing_the_provisional_ranking_until_the_reveal() {
+    let w = world();
+    let a = player(&w, 1).await;
+    let _b = player(&w, 2).await;
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    adv(Duration::from_millis(600)).await;
+    h.frames();
+    answer(&a, 1, 0b0010).await;
+    settle().await;
+    h.send(ClientFrame::Next).await; // the host closes with one answer in
+    settle().await;
+    let f = h.frames();
+    assert!(last_of(&f, 4).is_some(), "the ranking up to the close");
+    assert_eq!(last_of(&f, 11).unwrap(), &json!([11, 1]));
+    assert!(last_of(&f, 5).is_none());
 }

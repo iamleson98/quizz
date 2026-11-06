@@ -47,7 +47,10 @@ LMS's own ids (text), opaque to this service.
   close will apply, so the provisional ranking is the final one. Players are
   never sent any of it while a question is open: a moving ranking would tell an
   unanswered student which option is right.
-- Answer keys never leave the service before a question's reveal.
+- Answer keys never leave the service before a question's reveal. When a
+  question closes everybody gets a tiny `closed` frame at once, and the reveal
+  follows after a 2.5 s beat (`REVEAL_DELAY_MS`; the host's `next` skips it), so
+  the class waits for it together.
 - Answers are held in memory during a question and written in **one
   transaction when it closes**: a class answering together is one write.
 - A game's connected minutes (the host's, each player's) are pushed to the LMS
@@ -329,11 +332,11 @@ at its default of 2), a typical question (80 characters, four options of 30):
 
 | | 300 players | 1,000 players (2 classes) | budget |
 |---|---:|---:|---:|
-| received per player per question | 427 B | 427 B | 1,024 B |
+| received per player per question | 435 B | 435 B | 1,024 B |
 | sent per player per question | 13 B | 13 B | 64 B |
-| frames received per player per question | 3 | 3 | |
-| whole class reached after a question opens (slowest) | 20.2 ms | 18.9 ms | 100 ms |
-| last answer to the reveal received everywhere (slowest) | 9.9 ms | 12.8 ms | |
+| frames received per player per question (question, ack, closed, reveal) | 4 | 4 | |
+| whole class reached after a question opens (slowest, typical run) | 4.2 ms | 19 ms | 100 ms |
+| last answer to the closed frame received everywhere (slowest) | 3.7 ms | 32.7 ms | |
 | memory per idle socket | 17.2 KiB | 11.7 KiB | 20 KiB |
 | idle RSS | 7.3 MiB | 7.2 MiB | 20 MiB |
 | question close (reveal and one write), mean | 33.9 ms | 42.0 ms | |

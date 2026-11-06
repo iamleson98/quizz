@@ -41,7 +41,7 @@ numbers; times are unix epoch milliseconds.
 |---|---|---|
 | `[0,"<ticket>"]` | both | **hello**: the first frame, and only the first |
 | `[1,"<quizId>"]` | host | **start**: open a lobby for this quiz (the id from the bank API, a string) |
-| `[2]` | host | **next**: start the first question; close the open question; move on from a reveal; leave the podium (ends the game) |
+| `[2]` | host | **next**: start the first question; close the open question; reveal a closed question at once (skipping the beat); move on from a reveal; leave the podium (ends the game) |
 | `[3]` | host | **end**: end the game now |
 | `[4,q,mask]` | player | **answer** question number `q` (1-based, as in the question frame) with the options in `mask` |
 
@@ -63,6 +63,7 @@ reports time.
 | 2 | `[2,now,q,count,endsAt,kind,"text",["opt",...]]` | **question** `q` of `count` is open |
 | 3 | `[3,players]` | **count**: players in the lobby (everyone, in the lobby only) |
 | 4 | `[4,answered,players,[c0,c1,...],[["name",total],...]]` | **progress** (host only): answers so far, how many players chose each option so far, and the provisional top ten, during a question |
+| 11 | `[11,q]` | **closed**: question `q` is closed (no more answers); its reveal follows after a beat |
 | 5 | `[5,q,correct,[counts],explanation,[["name",score]...],score,rank,points,right,mine,streak,bonus]` | **reveal** of question `q` |
 | 6 | `[6,[["name",score]...(3)],score,rank]` | **podium** for a player |
 | 6 | `[6,[["name",score]...(3)],[["name",score]...(all)]]` | **podium** for the host |
@@ -79,6 +80,20 @@ Details:
 - `endsAt` is the question's deadline on the server's clock. The server closes
   the question at `endsAt`, when every connected player eligible to answer has
   answered, or when the host sends `next`, whichever comes first.
+- **Closed, then the beat, then the reveal.** The moment a question closes
+  every socket (players and host) gets the tiny shared `[11,q]`: players lock
+  their screen, the host shows "revealing". The reveal (`[5,...]`, which carries
+  the correct options and the ranking) is sent only `REVEAL_DELAY_MS = 2500` ms
+  later, so the class waits for it together. Until then **nothing on any socket
+  carries the correct options or a ranking**: not the question, not the
+  progress frames, not the closed frame. A host `next` during the beat reveals
+  at once; a `next` after the reveal moves on, as before (so pressing it twice
+  while a question is open closes it and then reveals it; a press that arrives
+  after the beat's own timer is simply the "move on" press). An answer that
+  arrives during the beat is refused with `[8,5,4]`. The provisional ranking
+  frames to the host continue as long as anything changes, which is only until
+  the close. If the game ends during the beat (the host's `end`, the room
+  closing) the reveal is sent first and the end after it.
 - A **reveal** has a personal tail for players (`score, rank, points, right,
   mine, streak, bonus`: total score, rank among the players (0 until ranked),
   points this question **including the streak bonus**, 1 if right else 0, the
@@ -158,6 +173,7 @@ where the room is:
 | no game | `[0,now]` |
 | lobby | the lobby frame |
 | a question is open | the question frame, with a **tail**: the options you already chose as a mask (`0` for none), as a last element after the options array. The host's has no tail. |
+| closed, waiting for the reveal | `[11,q]` (the reveal follows by itself) |
 | reveal | the reveal frame with your personal tail |
 | podium | the podium frame |
 
@@ -200,8 +216,9 @@ server, so a wrong client clock cannot buy points.
 ## What it costs
 
 Per player per question (80 characters, four options of 30): the question frame
-(~250 B), the reveal with the player's own result (~160 B) and a 5-byte ack are
-received: 3 frames, about 430 B on the wire including websocket headers; one
+(~250 B), a 5-byte ack, the 8-byte closed frame and the reveal with the
+player's own result (~160 B) are received: 4 frames, about 435 B on the wire
+including websocket headers; one
 answer frame of about 7 B (13 B with the websocket header and mask) is sent.
 Nothing else is sent per answer to anybody.
 
@@ -226,6 +243,8 @@ a running service; see the README.
 ← [2,1793931351000,1,3,1793931371000,0,"1/2 + 1/2 = ?",["1","2","0","1/4"]]
 → [4,1,1]                                  answer question 1: option 1
 ← [9]
+← [11,1]                                   closed: lock the screen
+                                           ... 2.5 s later, or when the host presses next:
 ← [5,1,1,[8,3,1,0],"one whole",[["An",1000],["Binh",990]],990,2,990,1,1,1,0]
                                            score 990, rank 2, 990 points, right,
                                            chose option 1, streak 1, bonus 0
