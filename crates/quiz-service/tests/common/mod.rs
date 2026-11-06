@@ -67,6 +67,11 @@ pub fn ticket(state: &AppState, role: Role, sub: &str) -> String {
 }
 
 pub fn ticket_for(state: &AppState, role: Role, sub: &str, sid: &str) -> String {
+    ticket_closing(state, role, sub, sid, state.now_ms() + 2 * 60 * 60 * 1000)
+}
+
+/// A ticket whose room closes at `rc` (unix ms).
+pub fn ticket_closing(state: &AppState, role: Role, sub: &str, sid: &str, rc: i64) -> String {
     let in_room = role != Role::Teacher;
     Ticket {
         sub: sub.into(),
@@ -74,7 +79,7 @@ pub fn ticket_for(state: &AppState, role: Role, sub: &str, sid: &str) -> String 
         role,
         sid: in_room.then(|| sid.to_string()),
         cid: in_room.then(|| "c1".to_string()),
-        rc: in_room.then(|| state.now_ms() + 2 * 60 * 60 * 1000),
+        rc: in_room.then_some(rc),
     }
     .sign(&state.cfg.ticket_key, now_secs(), now_secs() + 600)
     .expect("sign")

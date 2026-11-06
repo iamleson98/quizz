@@ -9,7 +9,7 @@ use crate::auth::{Role, Ticket};
 use crate::error::AppError;
 use crate::game::frames::{self, ClientFrame, Out, parse_client};
 use crate::game::registry::{Turned, UnknownGuard, out_channel};
-use crate::game::room::Member;
+use crate::game::room::{Member, ROOM_CLOSE_GRACE};
 use crate::state::AppState;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, State};
@@ -166,7 +166,16 @@ async fn hello(state: &AppState, socket: &mut WebSocket) -> Result<Ticket, (u8, 
     };
     let ticket = Ticket::verify(&state.ticket_key, &token).map_err(|_| (1, "bad ticket"))?;
     match ticket.role {
-        Role::Host | Role::Player => Ok(ticket),
+        Role::Host | Role::Player => {
+            // the lesson is over: its sockets were closed a grace after `rc`
+            let over = ticket
+                .rc
+                .is_some_and(|rc| rc + ROOM_CLOSE_GRACE.as_millis() as i64 <= state.now_ms());
+            if over {
+                return Err((1, "room closed"));
+            }
+            Ok(ticket)
+        }
         Role::Teacher => Err((2, "no game for this ticket")),
     }
 }

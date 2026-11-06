@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use common::*;
 use futures::{SinkExt, StreamExt};
 use quiz_service::auth::Role;
+use quiz_service::game::registry::Counts;
 use quiz_service::server::public_router;
 use quiz_service::state::AppState;
 use serde_json::{Value, json};
@@ -155,6 +156,41 @@ async fn closed(ws: &mut Ws) -> bool {
         .await,
         Ok(true)
     )
+}
+
+/// The code and reason of the close frame that ends the socket, skipping
+/// whatever text is still queued ahead of it.
+async fn close_of(ws: &mut Ws) -> Option<(u16, String)> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    return Some((frame.code.into(), frame.reason.to_string()));
+                }
+                Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_))) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Wait until the service holds nothing for anybody: no room, no person's
+/// slot, no address waiting for a hello, no game.
+async fn settled(s: &Service) {
+    let end = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let c = s.state.rooms.counts();
+        if c == Counts::default() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < end,
+            "still holding something: {c:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn host_ticket(s: &Service, sub: &str) -> String {
@@ -415,11 +451,109 @@ async fn shutdown_ends_a_running_game_and_closes_it_in_the_database() {
         json!([7, 3]),
         "the game ended because the service restarts"
     );
+    assert_eq!(close_of(&mut p).await, Some((1001, "restart".into())));
+    assert_eq!(close_of(&mut host).await, Some((1001, "restart".into())));
+    settled(&s).await;
     let ended: Option<i64> = sqlx::query_scalar("SELECT ended_at FROM games")
         .fetch_one(&s.state.pool)
         .await
         .unwrap();
     assert!(ended.is_some(), "the game was closed in the database");
+}
+
+#[tokio::test]
+async fn a_hello_after_the_lesson_ended_is_refused_but_a_late_one_within_the_grace_is_not() {
+    let s = serve(&[]).await;
+    let late = |ms_ago: i64, role| {
+        ticket_closing(&s.state, role, "student1", "s1", s.state.now_ms() - ms_ago)
+    };
+    // the room closed 21 s ago: past the grace
+    let (mut ws, first) = s.join(&late(21_000, Role::Player)).await;
+    assert_eq!(first, json!([8, 1, 0]), "unauthorized, as for a bad ticket");
+    assert!(closed(&mut ws).await);
+    let (mut ws, first) = s.join(&late(3_600_000, Role::Host)).await;
+    assert_eq!(first, json!([8, 1, 0]));
+    assert!(closed(&mut ws).await);
+    settled(&s).await;
+
+    // closed 10 s ago: the grace lets the person see how it ended
+    let (_ws, first) = s.join(&late(10_000, Role::Player)).await;
+    assert_eq!(first[0], 0);
+    // a teacher's bank ticket has no room close at all
+    let teacher = ticket(&s.state, Role::Teacher, "teacher1");
+    let (_ws, first) = s.join(&teacher).await;
+    assert_eq!(
+        first,
+        json!([8, 2, 0]),
+        "refused for its role, not its time"
+    );
+}
+
+#[tokio::test]
+async fn every_way_a_socket_ends_releases_its_slots_and_the_room() {
+    let s = serve(&[
+        ("QUIZ_WS_PING_SECS", "1".into()),
+        ("QUIZ_WS_PONG_SECS", "1".into()),
+    ])
+    .await;
+    let quiz_id = s.quiz("teacher1").await;
+
+    // a socket that never says hello holds an address slot until it goes
+    let silent = s.open(&player_ticket(&s, "x")).await;
+    assert_eq!(s.state.rooms.counts().unknown_sockets, 1);
+    drop(silent);
+    settled(&s).await;
+    // a bad ticket
+    let (mut bad, first) = s.join("not-a-ticket").await;
+    assert_eq!(first, json!([8, 1, 0]));
+    assert!(closed(&mut bad).await);
+    settled(&s).await;
+
+    // the client closes: its person, its place in the room, the room
+    let token = player_ticket(&s, "student1");
+    let (mut ws, _) = s.join(&token).await;
+    let c = s.state.rooms.counts();
+    assert_eq!((c.rooms, c.people, c.sockets), (1, 1, 1));
+    ws.close(None).await.unwrap();
+    drop(ws);
+    settled(&s).await;
+
+    // five sockets of one person: the oldest is pushed out and its slot is
+    // not counted twice
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.push(s.join(&token).await.0);
+    }
+    assert!(closed(&mut held[0]).await);
+    let c = s.state.rooms.counts();
+    assert_eq!((c.people, c.sockets), (1, 4), "{c:?}");
+    drop(held);
+    settled(&s).await;
+
+    // a peer that stops answering pings
+    let (mut quiet, _) = s.join(&token).await;
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    assert!(closed(&mut quiet).await, "no pong: closed");
+    drop(quiet);
+    settled(&s).await;
+
+    // a game that ended, and then the last socket leaves
+    let (mut host, _) = s.join(&host_ticket(&s, "teacher1")).await;
+    let (mut p, _) = s.join(&token).await;
+    send(&mut host, json!([1, quiz_id])).await;
+    recv_kind(&mut p, 1).await;
+    assert_eq!(s.state.rooms.counts().running_games, 1);
+    send(&mut host, json!([3])).await;
+    assert_eq!(recv_kind(&mut p, 7).await, json!([7, 0]));
+    assert_eq!(s.state.rooms.counts().running_games, 0);
+    assert_eq!(
+        s.state.rooms.counts().rooms,
+        1,
+        "the sockets are still here"
+    );
+    drop(host);
+    drop(p);
+    settled(&s).await;
 }
 
 #[tokio::test]

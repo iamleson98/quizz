@@ -28,7 +28,9 @@ Sec-WebSocket-Protocol: quiz.v1
 - Tickets are signed by the LMS server: `role` `host` (the session's teacher) or
   `player` (a student of the session), with `sid`, `cid` and `rc`. A `teacher`
   ticket has no game: it is answered `[8,2,0]` and the socket is closed. The
-  ticket is checked **once**, when the socket opens.
+  ticket is checked **once**, when the socket opens. A `hello` whose ticket's
+  `rc` passed more than 20 s ago (the lesson is over) is answered `[8,1,0]`, as
+  for a bad ticket, and the socket is closed.
 - The socket belongs to the room of the ticket's `sid`. There is one room per
   live session, created by the first socket and gone with the last; it exists
   before any game does, so students already in the room see the game begin.
@@ -68,7 +70,7 @@ reports time.
 | 5 | `[5,q,correct,[counts],explanation,[["name",score]...],score,rank,points,right,mine,streak,bonus]` | **reveal** of question `q` |
 | 6 | `[6,[["name",score]...(3)],score,rank]` | **podium** for a player |
 | 6 | `[6,[["name",score]...(3)],[["name",score]...(all)]]` | **podium** for the host |
-| 7 | `[7,reason]` | **ended**: `0` the host ended it, `1` the room closed, `2` idle for an hour, `3` the service is restarting |
+| 7 | `[7,reason]` | **ended**: `0` the host ended it, `1` the room closed (the ticket's `rc`), `2` idle (an hour without a command, or nobody connected for 5 minutes), `3` the service is restarting, `4` the host left (no host socket for 2 minutes) |
 | 8 | `[8,code,request]` | **error** for a client frame of type `request` (`0` for hello) |
 | 9 | `[9]` | **ack**: your answer is locked in |
 | 10 | `[10,["name",...]]` | **names** (host only): display names of players who joined the room |
@@ -227,9 +229,22 @@ server, so a wrong client clock cannot buy points.
   themselves, and a peer that has not answered 10 s after a ping is closed (1008).
   A frame the peer does not take within 10 s drops the socket too. There is no
   application heartbeat: do not send one.
-- A game ends by itself when the ticket's `rc` passes (reason `1`) or after an
-  hour without a host command or an answer (reason `2`). A deploy of the
-  service ends running games (reason `3`) and closes sockets with 1001.
+- A game ends by itself when the ticket's `rc` passes (reason `1`), after an
+  hour without a host command or an answer (reason `2`), when nobody at all has
+  been connected for 5 minutes (reason `2`; nothing is left to tell), or when the
+  host has had **no socket for 2 minutes** (reason `4`, **the host left**). A
+  host back sooner, from any tab, cancels that: the clock runs only while no host
+  socket is open. When the host left a game that was being played, it goes to
+  the podium first (the open question is closed and stored, as for the host's
+  `end`), then `[7,4]`; a lobby just ends. The results are stored once. Clients
+  show "the host left" and return to the board. A deploy of the service ends
+  running games (reason `3`) and closes sockets with 1001 "restart".
+- **Every socket is closed 20 s after its ticket's `rc`**, with close code 1001
+  and reason "room closed", whether a game is running or not, host or player.
+  The game has already ended at `rc` (`[7,1]`, results stored) and the frames
+  are delivered before the close, so the people still there see how it ended;
+  reconnecting is pointless (the `hello` is refused, see above). A socket whose
+  ticket has a later `rc` stays until its own.
 
 ## What it costs
 
@@ -271,6 +286,10 @@ a running service; see the README.
                                            the podium (after the last reveal, or at once
                                            when the host pressed end during question 2)
 ← [7,0]                                    the host pressed next (or end) at the podium
+                                           (`[7,4]` instead when the host's sockets stayed
+                                           gone for 2 minutes: "the host left", back to the board)
+                                           ... and 20 s after the ticket's `rc` the socket is
+                                           closed: 1001 "room closed"
 ```
 
 And what the host sees of the same round, besides the question and the reveal:

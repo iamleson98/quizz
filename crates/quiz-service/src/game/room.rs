@@ -30,6 +30,17 @@ use tokio::time::Instant;
 pub const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 /// A game with no command for this long ends by itself.
 pub const IDLE_LIMIT: Duration = Duration::from_secs(60 * 60);
+/// A socket stays open this long after its ticket's `rc` (the room's close
+/// time): the game has ended at `rc`, and the people still there see it end.
+/// Then every socket is closed (1001 "room closed"), and a hello whose `rc`
+/// is further past than this is refused.
+pub const ROOM_CLOSE_GRACE: Duration = Duration::from_secs(20);
+/// A running game whose host has had no socket for this long ends
+/// ([`EndReason::HostLeft`]); a host back sooner (any tab) cancels it.
+pub const HOST_AWAY_LIMIT: Duration = Duration::from_secs(120);
+/// A running game with no socket at all for this long ends
+/// ([`EndReason::Idle`]), so the room is freed.
+pub const EMPTY_ROOM_LIMIT: Duration = Duration::from_secs(5 * 60);
 /// Frames a socket may have waiting before it is cut as too slow.
 pub const OUT_QUEUE: usize = 8;
 /// The beat between a question closing and its reveal (the correct options
@@ -113,6 +124,8 @@ pub(super) struct Sock {
     pub(super) role: Role,
     pub(super) cid: String,
     pub(super) rc: i64,
+    /// When the socket is closed: `rc` plus [`ROOM_CLOSE_GRACE`].
+    pub(super) close_at: Instant,
     pub(super) out: mpsc::Sender<Out>,
     /// Index into the game's players, for a player socket in a game.
     pub(super) pid: Option<usize>,
@@ -272,6 +285,13 @@ pub struct Room {
     pub(super) t0: Instant,
     /// Sockets to drop after the current command (too slow or gone).
     pub(super) slow: Vec<u64>,
+    /// The earliest `close_at` of the sockets (it may be early after a socket
+    /// left; the timer recomputes it).
+    sock_close_at: Option<Instant>,
+    /// When the game's host has had no socket for [`HOST_AWAY_LIMIT`].
+    host_gone_at: Option<Instant>,
+    /// When the game has had no socket at all for [`EMPTY_ROOM_LIMIT`].
+    empty_at: Option<Instant>,
     pub(super) progress_dirty: bool,
     pub(super) count_dirty: bool,
     pub(super) flush_at: Option<Instant>,
@@ -292,6 +312,9 @@ pub fn spawn(deps: Deps, sid: String, id: u64) -> RoomHandle {
         quest: None,
         t0: now,
         slow: Vec::new(),
+        sock_close_at: None,
+        host_gone_at: None,
+        empty_at: None,
         progress_dirty: false,
         count_dirty: false,
         flush_at: None,
@@ -317,6 +340,17 @@ impl Room {
         self.wall(Instant::now())
     }
 
+    /// The instant a socket with room-close time `rc` (unix ms) is closed.
+    pub(super) fn close_at(&self, rc: i64, now: Instant) -> Instant {
+        let until_rc = Duration::from_millis((rc - self.wall(now)).max(0) as u64);
+        now + until_rc + ROOM_CLOSE_GRACE
+    }
+
+    /// A socket with this `close_at` joined.
+    pub(super) fn note_close_at(&mut self, at: Instant) {
+        self.sock_close_at = Some(self.sock_close_at.map_or(at, |t| t.min(at)));
+    }
+
     async fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
         loop {
             let wake = self.next_wake();
@@ -330,6 +364,7 @@ impl Room {
                 _ = sleep_until_opt(wake) => self.on_timer().await,
             }
             self.reap().await;
+            self.watch_presence();
             if self.socks.is_empty() && self.game.is_none() && self.quest.is_none() {
                 break;
             }
@@ -351,6 +386,10 @@ impl Room {
             g.map(|g| g.idle_at),
             self.flush_at,
             self.quest_next_wake(),
+            self.sock_close_at,
+            self.empty_at,
+            // with nobody connected the empty-room limit decides
+            self.host_gone_at.filter(|_| !self.socks.is_empty()),
         ]
         .into_iter()
         .flatten()
@@ -384,6 +423,64 @@ impl Room {
             }
         }
         self.quest_on_timer().await;
+        self.end_abandoned_game(now).await;
+        self.close_expired_sockets(now).await;
+    }
+
+    /// Keep the two abandonment timers right: they run only while a game
+    /// does, the host's from the moment the last host socket went, the
+    /// room's from the moment the last socket of anybody went.
+    fn watch_presence(&mut self) {
+        if self.game.is_none() && self.quest.is_none() {
+            self.host_gone_at = None;
+            self.empty_at = None;
+            return;
+        }
+        let now = Instant::now();
+        let host_here = self.socks.values().any(|s| s.role == Role::Host);
+        self.host_gone_at = if host_here {
+            None
+        } else {
+            self.host_gone_at.or(Some(now + HOST_AWAY_LIMIT))
+        };
+        self.empty_at = if self.socks.is_empty() {
+            self.empty_at.or(Some(now + EMPTY_ROOM_LIMIT))
+        } else {
+            None
+        };
+    }
+
+    /// End a game nobody is running: the host stayed away, or everybody did.
+    async fn end_abandoned_game(&mut self, now: Instant) {
+        if self.game.is_none() && self.quest.is_none() {
+            return;
+        }
+        if !self.socks.is_empty() && self.host_gone_at.is_some_and(|t| now >= t) {
+            self.end_host_left().await;
+        } else if self.empty_at.is_some_and(|t| now >= t) {
+            self.finish(EndReason::Idle).await;
+        }
+    }
+
+    /// Close the sockets whose ticket's room closed a grace ago. By then the
+    /// game has ended (at `rc`) and its frames are queued ahead of the close.
+    async fn close_expired_sockets(&mut self, now: Instant) {
+        if !self.sock_close_at.is_some_and(|t| now >= t) {
+            return;
+        }
+        let due: Vec<u64> = self
+            .socks
+            .iter()
+            .filter(|(_, s)| now >= s.close_at)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in due {
+            if let Some(s) = self.socks.get(&id) {
+                let _ = s.out.try_send(Out::Close(1001, "room closed"));
+            }
+            self.detach(id).await;
+        }
+        self.sock_close_at = self.socks.values().map(|s| s.close_at).min();
     }
 
     /// Handle one command; true when the room must stop now.
@@ -466,6 +563,7 @@ impl Room {
         }
         let now = Instant::now();
         let wall = self.wall(now);
+        let close_at = self.close_at(m.rc, now);
         let mut pid = None;
         if let Some(g) = &mut self.game {
             match m.role {
@@ -485,10 +583,12 @@ impl Room {
                 role: m.role,
                 cid: m.cid,
                 rc: m.rc,
+                close_at,
                 out: m.out,
                 pid,
             },
         );
+        self.note_close_at(close_at);
         let sync = self.sync_frame(m.sock);
         self.push(m.sock, sync);
         if m.role == Role::Host {
@@ -970,18 +1070,39 @@ impl Room {
         self.touch();
         match phase {
             Phase::Lobby | Phase::Podium => self.finish(EndReason::Host).await,
+            _ => self.show_podium(phase).await,
+        }
+        Ok(())
+    }
+
+    /// Stop a game that is being played and show the podium: the open
+    /// question is closed and scored without a closed frame or a reveal, the
+    /// results are stored once. A lobby or a podium is left as it is.
+    async fn show_podium(&mut self, phase: Phase) {
+        match phase {
             Phase::Question | Phase::Closing => {
                 if let Some(g) = &mut self.game {
                     g.phase = Phase::Closing;
                 }
-                // scored and stored, without a closed frame or a reveal: the
-                // podium follows at once
                 self.score_question(false).await;
                 self.open_podium().await;
             }
             Phase::Reveal => self.open_podium().await,
+            Phase::Lobby | Phase::Podium => {}
         }
-        Ok(())
+    }
+
+    /// The host has been away too long: what was played goes to the podium
+    /// and is stored once, then the game ends with [`EndReason::HostLeft`].
+    pub(super) async fn end_host_left(&mut self) {
+        if self.quest.is_some() {
+            return self.quest_host_left().await;
+        }
+        let Some(phase) = self.game.as_ref().map(|g| g.phase) else {
+            return;
+        };
+        self.show_podium(phase).await;
+        self.finish(EndReason::HostLeft).await;
     }
 
     fn open_question(&mut self, qi: usize) {

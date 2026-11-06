@@ -72,7 +72,7 @@ LMS's own ids (text), opaque to this service.
 | `name` | display name, shown on the scoreboard |
 | `role` | `teacher` (the bank only), `host` (the teacher of this session: the bank and running its game), `player` (a student of this session) |
 | `sid`, `cid` | session id and class id (`host` and `player` only) |
-| `rc` | when the room closes, unix ms (`host` and `player` only): the game ends then |
+| `rc` | when the room closes, unix ms (`host` and `player` only): the game ends then and the socket is closed 20 s later |
 | `iat` / `exp` | valid 10 minutes; a socket is checked once, when it opens |
 
 HTTP: `Authorization: Bearer <ticket>`. Websocket: the first frame, `hello`.

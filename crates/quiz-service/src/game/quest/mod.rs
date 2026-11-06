@@ -1002,6 +1002,8 @@ impl Room {
         if m.role == Role::Player {
             metrics::gauge!("quiz_players_connected").increment(1.0);
         }
+        let close_at = self.close_at(m.rc, now);
+        self.note_close_at(close_at);
         self.socks.insert(
             m.sock,
             Sock {
@@ -1010,6 +1012,7 @@ impl Room {
                 role: m.role,
                 cid: m.cid,
                 rc: m.rc,
+                close_at,
                 out: m.out,
                 pid,
             },
@@ -1247,6 +1250,19 @@ impl Room {
             }
             Err(e) => tracing::error!(error = %e, game = id, "writing the quest results failed"),
         }
+    }
+
+    /// The host has been away too long: a game being played goes to the
+    /// podium (the time is up), then it ends with [`EndReason::HostLeft`].
+    pub(super) async fn quest_host_left(&mut self) {
+        if let Some(q) = self.quest.as_mut()
+            && matches!(q.phase, QPhase::Running { .. })
+        {
+            let mut fx = Fx::default();
+            q.time_up(&mut fx);
+            self.apply_fx(fx);
+        }
+        self.quest_finish(EndReason::HostLeft).await;
     }
 
     /// End the game: store the results (unless the podium already did), tell

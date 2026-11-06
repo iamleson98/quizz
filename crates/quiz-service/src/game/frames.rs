@@ -61,6 +61,8 @@ pub enum EndReason {
     RoomClosed = 1,
     Idle = 2,
     Restart = 3,
+    /// The host's sockets stayed gone for [`super::room::HOST_AWAY_LIMIT`].
+    HostLeft = 4,
 }
 
 /// A frame from a client.

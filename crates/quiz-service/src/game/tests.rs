@@ -119,6 +119,19 @@ impl Client {
         self.room.frame(self.sock, frame, Instant::now()).await;
     }
 
+    /// Everything waiting now, in order: each frame's text, and a close as
+    /// `close:<code>:<reason>`.
+    pub(crate) fn trace(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(o) = self.rx.try_recv() {
+            match o {
+                Out::Close(code, reason) => out.push(format!("close:{code}:{reason}")),
+                other => out.extend(other.into_text().map(|t| t.to_string())),
+            }
+        }
+        out
+    }
+
     /// Frames waiting now, as JSON.
     pub(crate) fn frames(&mut self) -> Vec<Value> {
         let mut out = Vec::new();
@@ -152,6 +165,23 @@ pub(crate) async fn connect(w: &World, sid: &str, user: &str, role: Role) -> Cli
 }
 
 pub(crate) async fn try_connect(w: &World, sid: &str, user: &str, role: Role) -> AppResult<Client> {
+    try_connect_rc(w, sid, user, role, ROOM_CLOSES).await
+}
+
+/// A socket whose ticket says the room closes at `rc` (unix ms).
+pub(crate) async fn connect_rc(w: &World, user: &str, role: Role, rc: i64) -> Client {
+    try_connect_rc(w, "s1", user, role, rc)
+        .await
+        .expect("attached")
+}
+
+async fn try_connect_rc(
+    w: &World,
+    sid: &str,
+    user: &str,
+    role: Role,
+    rc: i64,
+) -> AppResult<Client> {
     let (out, rx) = super::registry::out_channel();
     let sock = w.deps.rooms.next_sock_id();
     let member = Member {
@@ -160,7 +190,7 @@ pub(crate) async fn try_connect(w: &World, sid: &str, user: &str, role: Role) ->
         name: format!("name-{user}"),
         role,
         cid: "class".into(),
-        rc: ROOM_CLOSES,
+        rc,
         out,
     };
     let room = w.deps.rooms.attach(&w.deps, sid, member).await?;
@@ -1545,4 +1575,276 @@ async fn the_race_podium_ends_by_itself_after_an_hour_with_one_write() {
         "the idle end does not store a second time"
     );
     assert!(w.deps.rooms.running_quiz_ids().is_empty());
+}
+
+// ----------------------------------------------- lifetime of sockets and rooms
+
+use super::room::{EMPTY_ROOM_LIMIT, HOST_AWAY_LIMIT, ROOM_CLOSE_GRACE};
+
+pub(crate) const CLOSED: &str = "close:1001:room closed";
+
+/// A socket's task ended: tell the room and let it settle.
+pub(crate) async fn leave(c: &Client) {
+    c.room.detach(c.sock).await;
+    settle().await;
+}
+
+pub(crate) fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
+/// The reason of the last ended frame in `trace`, if any.
+pub(crate) fn ended_reason(trace: &[String]) -> Option<String> {
+    trace.iter().rev().find(|t| t.starts_with("[7,")).map(|t| {
+        t.trim_start_matches("[7,")
+            .trim_end_matches(']')
+            .to_string()
+    })
+}
+
+pub(crate) fn nothing_left(w: &World) {
+    assert_eq!(
+        w.deps.rooms.counts(),
+        super::registry::Counts::default(),
+        "the registry holds nothing"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_socket_is_closed_a_grace_after_its_ticket_room_close_game_or_not() {
+    let w = world();
+    let rc = BASE + 60_000;
+    let mut h = connect_rc(&w, "teacher", Role::Host, rc).await;
+    let mut p = connect_rc(&w, "p1", Role::Player, rc).await;
+    // a student whose ticket says the room closes later stays longer
+    let mut late = connect_rc(&w, "p2", Role::Player, rc + 30_000).await;
+    h.trace();
+    p.trace();
+    late.trace();
+
+    adv(secs(60) + ROOM_CLOSE_GRACE - Duration::from_millis(200)).await;
+    assert!(h.trace().is_empty() && p.trace().is_empty(), "not yet");
+    adv(Duration::from_millis(400)).await;
+    assert_eq!(h.trace(), vec![CLOSED], "the host's socket is closed");
+    assert_eq!(p.trace(), vec![CLOSED]);
+    assert!(late.trace().is_empty(), "its own room close is later");
+    assert_eq!(w.deps.rooms.counts().rooms, 1, "one socket keeps the room");
+
+    adv(secs(30)).await;
+    assert_eq!(late.trace(), vec![CLOSED]);
+    nothing_left(&w);
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_the_room_close_the_game_ends_and_is_stored_before_the_sockets_close() {
+    let w = world();
+    let rc = BASE + 10 * 60_000;
+    let mut h = connect_rc(&w, "teacher", Role::Host, rc).await;
+    let mut p = connect_rc(&w, "p1", Role::Player, rc).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    h.send(ClientFrame::Next).await; // keeps the idle clock fresh
+    settle().await;
+    adv(secs(10 * 60)).await;
+    let t = p.trace();
+    assert_eq!(
+        t.last().map(String::as_str),
+        Some("[7,1]"),
+        "ended at rc: {t:?}"
+    );
+    assert_eq!(ended_writes(&w), 1, "stored at rc");
+    assert!(w.deps.rooms.running_quiz_ids().is_empty());
+    assert!(h.trace().iter().any(|t| t == "[7,1]"));
+
+    adv(ROOM_CLOSE_GRACE + secs(1)).await;
+    assert_eq!(p.trace(), vec![CLOSED], "then the socket is closed");
+    assert_eq!(h.trace(), vec![CLOSED]);
+    assert_eq!(ended_writes(&w), 1);
+    nothing_left(&w);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_host_away_for_two_minutes_ends_a_lobby_with_reason_4_and_a_host_back_in_time_stays() {
+    let w = world();
+    let mut p = player(&w, 1).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    p.trace();
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT - secs(1)).await;
+    assert!(p.trace().is_empty());
+
+    // back in time: the timer is cancelled, and a second tab counts too
+    let mut again = host(&w).await;
+    let second_tab = host(&w).await;
+    again.trace();
+    adv(secs(10 * 60)).await;
+    assert!(ended_reason(&p.trace()).is_none(), "the host is here");
+    leave(&again).await;
+    adv(secs(10 * 60)).await;
+    assert!(ended_reason(&p.trace()).is_none(), "the other tab is here");
+
+    leave(&second_tab).await;
+    adv(HOST_AWAY_LIMIT + secs(1)).await;
+    let t = p.trace();
+    assert_eq!(ended_reason(&t).as_deref(), Some("4"), "{t:?}");
+    assert!(
+        t.iter().all(|f| !f.starts_with("[6,")),
+        "nothing was played: no podium"
+    );
+    assert_eq!(ended_writes(&w), 1);
+    assert!(w.deps.rooms.running_quiz_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_host_gone_during_a_question_shows_the_podium_and_stores_once_then_ends_with_reason_4() {
+    let (w, h, mut ps) = race_with_two_answers().await;
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT + secs(1)).await;
+    let t = ps[0].trace();
+    let podium = t
+        .iter()
+        .position(|f| f.starts_with("[6,"))
+        .expect("a podium");
+    let ended = t.iter().position(|f| f == "[7,4]").expect("reason 4");
+    assert!(podium < ended, "the podium first: {t:?}");
+    assert!(t.iter().all(|f| !f.starts_with("[5,")), "no reveal: {t:?}");
+    assert_eq!(ended_writes(&w), 1);
+    assert_eq!(stored_answers(&w), 2, "the open question was stored");
+    assert!(w.deps.rooms.running_quiz_ids().is_empty());
+    ps[1].trace();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_host_gone_during_a_reveal_or_the_podium_ends_with_reason_4_and_one_write() {
+    // during a reveal
+    let (w, h, mut ps) = race_with_two_answers().await;
+    h.send(ClientFrame::Next).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    ps[0].trace();
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT + secs(1)).await;
+    let t = ps[0].trace();
+    assert!(t.iter().any(|f| f.starts_with("[6,")), "{t:?}");
+    assert_eq!(ended_reason(&t).as_deref(), Some("4"));
+    assert_eq!(ended_writes(&w), 1);
+    assert_eq!(stored_answers(&w), 2);
+
+    // on the podium
+    let (w, h, mut ps) = race_with_two_answers().await;
+    h.send(ClientFrame::End).await;
+    settle().await;
+    ps[0].trace();
+    assert_eq!(ended_writes(&w), 1, "stored when the podium opened");
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT + secs(1)).await;
+    assert_eq!(ended_reason(&ps[0].trace()).as_deref(), Some("4"));
+    assert_eq!(ended_writes(&w), 1, "not a second time");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_host_gone_while_a_question_closes_is_still_scored_before_the_end() {
+    let (w, h, mut ps) = race_with_two_answers().await;
+    h.send(ClientFrame::Next).await; // closed, the beat is running
+    settle().await;
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT + secs(1)).await;
+    // the beat's reveal came first, on its own timer
+    let t = ps[0].trace();
+    assert_eq!(ended_reason(&t).as_deref(), Some("4"), "{t:?}");
+    assert_eq!(ended_writes(&w), 1);
+    assert_eq!(stored_answers(&w), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_returning_student_cannot_keep_a_game_alive_whose_host_is_gone() {
+    let w = world();
+    let mut p = player(&w, 1).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    leave(&h).await;
+    adv(secs(60)).await;
+    leave(&p).await; // the room is empty, the host's clock runs on
+    adv(secs(100)).await;
+    assert_eq!(w.deps.rooms.counts().running_games, 1, "nobody to tell");
+    let mut back = player(&w, 1).await;
+    adv(secs(1)).await;
+    assert_eq!(ended_reason(&back.trace()).as_deref(), Some("4"));
+    p.trace();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_game_with_no_socket_at_all_ends_after_five_minutes_and_frees_the_room() {
+    let w = world();
+    let p = player(&w, 1).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    leave(&p).await;
+    leave(&h).await;
+    adv(EMPTY_ROOM_LIMIT - secs(2)).await;
+    let c = w.deps.rooms.counts();
+    assert_eq!((c.rooms, c.running_games), (1, 1), "still there");
+    assert_eq!(ended_writes(&w), 0);
+    adv(secs(4)).await;
+    nothing_left(&w);
+    assert_eq!(ended_writes(&w), 1, "stored once");
+    assert!(w.deps.rooms.running_quiz_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_room_without_a_game_is_freed_when_its_last_socket_goes() {
+    let w = world();
+    let p = player(&w, 1).await;
+    let h = host(&w).await;
+    assert_eq!(w.deps.rooms.counts().rooms, 1);
+    leave(&p).await;
+    leave(&h).await;
+    settle().await;
+    nothing_left(&w);
+}
+
+fn players_connected(handle: &metrics_exporter_prometheus::PrometheusHandle) -> f64 {
+    handle
+        .render()
+        .lines()
+        .find_map(|l| l.strip_prefix("quiz_players_connected "))
+        .map_or(0.0, |v| v.trim().parse().unwrap())
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_connected_players_gauge_follows_every_way_a_socket_leaves() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+
+    let rc = BASE + 60_000;
+    let w = world();
+    let h = connect_rc(&w, "teacher", Role::Host, rc).await;
+    let a = connect_rc(&w, "p1", Role::Player, rc).await;
+    let b = connect_rc(&w, "p2", Role::Player, rc).await;
+    let c = connect_rc(&w, "p3", Role::Player, rc + 120_000).await;
+    let d = connect_rc(&w, "p4", Role::Player, rc + 120_000).await;
+    assert_eq!(players_connected(&handle), 4.0);
+
+    leave(&a).await; // the socket's task ended
+    settle().await;
+    assert_eq!(players_connected(&handle), 3.0);
+    // a student the service forgets
+    w.deps.rooms.forget("p2").await;
+    settle().await;
+    assert_eq!(players_connected(&handle), 2.0);
+    // the lifetime limit
+    adv(secs(60) + ROOM_CLOSE_GRACE + secs(1)).await;
+    assert_eq!(players_connected(&handle), 2.0, "p3 and p4 stay");
+    // shutdown closes the rest
+    w.deps.rooms.shutdown(secs(5)).await;
+    settle().await;
+    assert_eq!(players_connected(&handle), 0.0);
+    nothing_left(&w);
+    drop((h, b, c, d));
 }
