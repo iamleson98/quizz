@@ -3,7 +3,8 @@
 The live game runs on one websocket, `GET /ws` on the public listener. The
 bank (quizzes, results) is the REST API in [`openapi.json`](openapi.json); this
 document is the other half of the contract, and the web client is written from
-it.
+it. The game has two modes: the class-paced **race**, described first, and the
+self-paced **quest**, described at the end ("Quest mode").
 
 The game is deliberately not GraphQL or JSON objects: a class of 500 hears the
 same question at the same moment, and every byte and every packet is paid
@@ -263,3 +264,206 @@ And what the host sees of the same round, besides the question and the reveal:
 ← [4,9,12,[1,6,2,0],[["An",990],["Chi",980],["Binh",960],...]]
                                            at most every 500 ms
 ```
+
+---
+
+# Quest mode (`quiz.v1`, same socket)
+
+Quest is a second game mode beside the race above. Everything about the
+socket, hello, tickets, errors `[8,code,request]`, the limits and the
+resync-on-hello rule applies unchanged. Quest adds client frames 5 to 8 and
+server frames 20 to 29; nothing in the race uses those numbers. The race's
+`[2]` next, `[3]` end, `[6]` podium, `[7]` ended and `[3,players]` count are
+reused. Quest has its own rules and shape: **self-paced**. Every student
+answers at their own speed from their own shuffled queue; a right answer earns
+coins and a treasure pick; the teacher watches a live board and the time runs
+out.
+
+## Starting
+
+`[1,"quizId",mode,seconds,flags]` (host). `mode` `0` is the race (the
+one-element form `[1,"quizId"]` stays valid and means the same); `1` is quest.
+`seconds` must be `300`, `600` or `900` (5, 10 or 15 minutes), otherwise
+`[8,4,1]`. `flags` bit 0 is **friendly mode**: no steals.
+
+| Phase | What happens |
+|---|---|
+| lobby | everybody gets `[20,...]`; players may choose a character; the host sees who is there |
+| running | the host's `[2]` starts the clock; every player gets their first question at once |
+| podium | at the end of the time, `[6,...]` (coins are the score); answers are refused |
+| ended | the host's `[2]` (or `[3]` at any time, or the room closing) ends it: `[7,reason]`, results stored |
+
+A second `[2]` while the game is running is refused `[8,5,2]`.
+
+## Client to server
+
+| Frame | Who | Meaning |
+|---|---|---|
+| `[5,character]` | player | choose a character, `0` to `11` (lobby or running); `[8,4,5]` for another number |
+| `[6,serial,mask]` | player | answer the question served with this `serial`; `mask` as in the race (one bit for single choice and true/false, the exact set for multiple choice) |
+| `[7,serial,chest]` | player | open chest `0`, `1` or `2` of the verdict with this `serial` |
+| `[8]` | player | ask for the question again (with the time you have left), or for the next one if none is open |
+
+Refused with `[8,code,request]` (`request` is the frame's first number):
+
+| Case | Code |
+|---|---|
+| an answer or pick for a serial that is not the current one | 5 |
+| a second answer (the first locks), an answer after the time, an answer while a chest is waiting or a pause runs | 5 |
+| an invalid choice of options (no bit, a bit beyond the options, several bits for a single question); the question stays open | 4 |
+| a pick without a chest waiting, or of a chest already opened | 5 |
+| a chest number above 2 | 4 |
+| `[8]` during the pause, or while a chest is waiting | 5 |
+| any quest frame before the game runs, or after the time is up | 5 |
+| a quest frame from the host, a race frame in a quest game, `[1,...]` from a player | 2 / 5 |
+
+The pause after a wrong answer is the server's: a player cannot get the next
+question earlier by asking.
+
+## Server to client
+
+| Type | Frame | To | When |
+|---|---|---|---|
+| 20 | `[20,now,"title",questions,players,seconds,flags]` | all | the lobby; also the first frame of anyone arriving in it |
+| 21 | `[21,[["name",character],...]]` | host | who joined or changed character, at most every 500 ms; once in full after the host's hello |
+| 22 | `[22,now,endsAt]` | all | the game is running until `endsAt` (the server's clock) |
+| 23 | `[23,coins,rank,streak,booster,shield,character,serial,pending,pauseMs]` | player | after hello, your whole state (below) |
+| 24 | `[24,kind,"text",["opt",...],limitSec,serial,remainingMs]` | player | a question for you |
+| 25 | `[25,serial,1,earned,streak,bonus,coins,boosterLeft]` | player | verdict: right |
+| 25 | `[25,serial,0\|2,0,0,0,coins,correctMask,pauseMs,explanation]` | player | verdict: wrong (0) or missed (2) |
+| 26 | `[26,serial,picked,kind,amount,coins,[k0,a0,k1,a1,k2,a2],victim,blocked]` | player | what the chest held |
+| 27 | `[27,0,"thief",amount,coins]` / `[27,1,"thief"]` / `[27,2]` | player | stolen from you / your shield blocked a steal / your booster ran out |
+| 28 | `[28,[["name",character,coins]x5],rank,coins]` | player | the standings strip |
+| 29 | `[29,[["name",character,coins]x10],players,answers,correct,msLeft]` | host | the live board |
+| 3 | `[3,players]` | all | the lobby's player count (race frame, reused) |
+| 6 | `[6,[["name",coins]x3],coins,rank]` / host: `[6,top3,all]` | all | the podium at the end of the time (race frame, reused) |
+| 7 | `[7,reason]` | all | ended |
+
+Details:
+
+- **Question (24).** `kind` is `0` single choice, `1` multiple choice, `2`
+  true/false, as in the race. Options keep their authored order, so the
+  frame's shared part is encoded once per question for everyone; only
+  `serial` and `remainingMs` are yours. `serial` counts the questions served to
+  *you* (1, 2, 3, ...); every answer and pick names it. `limitSec` is the longest
+  you may think: past it the question counts as missed. The answer key is never
+  in a question frame.
+- **Verdict (25).** `earned` is the answer's coins (double while a booster
+  runs), `streak` your right answers in a row counting this one, `bonus` the
+  streak bonus part of `earned` before doubling, `coins` your total, `boosterLeft`
+  right answers left that earn double. A right answer also means three chests are
+  waiting: pick one with `[7,serial,chest]`. A wrong or missed one shows
+  `correctMask` (bits of the right options) and `explanation` (a string or
+  `null`) and starts the pause of `pauseMs` (2500): the next question arrives by
+  itself when it is over. Missed (`2`) arrives when the time is up.
+- **Chest result (26).** `picked` is the chest you opened; `kind`/`amount` its
+  effect: kind `0` coins (+amount), `1` jackpot (+200), `2` booster (3 answers),
+  `3` shield, `4` steal (amount taken; `0` when blocked), `5` slip (amount lost,
+  never more than you had). `coins` is your new total. The array lists all three
+  chests as `kind,amount` pairs, shown afterwards for fun (an unpicked steal shows
+  amount `0`). For a steal, `victim` is the name of the player it was aimed at and
+  `blocked` is `1` when their shield stopped it; otherwise `null` and `0`. The
+  next question follows in its own frame.
+- **Events (27).** `[27,0,"Binh",12,80]`: Binh took 12 coins, you have 80 left.
+  `[27,1,"Binh"]`: your shield blocked Binh's steal (the shield is used up).
+  `[27,2]`: your booster has run out. These go only to the player they concern.
+- **Your state (23)** after a hello: `rank` is as of the last standings (0 at
+  first), `booster` the right answers left that earn double, `shield` 0/1,
+  `character` 0 to 11, `serial` the last question served to you, `pending` what
+  you are in the middle of (`0` nothing, `1` a question is open and follows
+  in its own frame with the time left, `2` a chest is waiting for `[7,serial,chest]`,
+  `3` the pause is running with `pauseMs` left; the next question comes by
+  itself). Right after it you get `[22,...]` first. A second socket of the same
+  player gets the same.
+- **Standings (28).** Top five with their characters and coins, then your own
+  rank and coins. At most once every 3 seconds, only to a player for whom
+  something changed (the top five, their rank, their coins). The shared part is
+  encoded once. A late joiner or a reconnect gets it at the next tick.
+- **Board (29)** for the host: the top ten by coins, the players, the answers
+  given so far, the right ones (so accuracy is `correct/answers`), and the ms
+  left. At most every 500 ms and only when something changed. A host that says
+  hello gets one at once.
+- **Roster (21)**: the host's list of names with their characters (increments in
+  the lobby and when somebody changes character; everything after a hello).
+  Players are never sent names other than in the standings and the podium.
+- **Podium (6)**: the race frame with coins as the score: the top three, your own
+  coins and rank; the host gets the full order. Then `[2]` (or `[3]`) from the host
+  ends it: `[7,0]`. The service closing, the room closing and an hour without a
+  command give `[7,3]`, `[7,1]` and `[7,2]` as in the race.
+
+## The rules (so the client can show them)
+
+- **Questions.** Each player's queue is the quiz's questions in a shuffle of their
+  own, repeated with a new shuffle when it runs out (a new round never begins with
+  the question just asked). A player who joins mid-game gets a queue and the first
+  question at once.
+- **Coins for an answer.** A fully right answer earns `10`, plus `floor(10 x
+  remaining/limit)` for speed, plus a streak bonus `min(5 x (streak - 1), 25)`.
+  Multiple choice needs the exact set (no partial credit). While a **booster** runs
+  (3 right answers) the answer's coins are doubled. A wrong or missed answer earns
+  nothing, ends the streak and starts a pause of 2.5 s.
+- **Chests.** After every right answer the server draws three hidden outcomes and
+  keeps them until you pick; nothing you send changes them. Odds per thousand at a
+  streak of 0:
+
+| Outcome | Effect | Odds |
+|---|---|---|
+| +20 coins | | 33% |
+| +40 coins | | 16.5% |
+| +80 coins | | 5.5% |
+| Jackpot | +200 coins | 4% |
+| Booster | the next 3 right answers earn double | 12% |
+| Shield | blocks the next steal against you (one at a time) | 10% |
+| Steal | takes 10% of a rival's coins (at most 100) | 15% |
+| Slip | -20 coins, never below 0 | 4% |
+
+  From a streak of 3 the rare outcomes (+80 and the jackpot) are exactly twice as
+  likely, from 6 three times; the others share what is left in their usual
+  proportions. A **steal** takes from a random player ranked above you by coins
+  (the runner-up when you lead). A shield blocks it and is used up; both of you are
+  told. In friendly mode, or when there is nobody to steal from, a steal that comes
+  up is replaced by coins. A player's coins never go below 0.
+- **End.** When the time is up (the `endsAt` of frame 22, on the server's clock)
+  the podium; the host ends the game. Results are stored once, at the end, for the
+  bank's results list (`mode: "quest"`, per player coins, answered, correct, best
+  streak). Nothing about a student is kept beyond that, and it expires like any
+  game's results (90 days).
+
+## An example (one player)
+
+```
+← [20,1793931348000,"Fractions",24,12,300,0]        lobby, 12 players, 5 minutes
+→ [5,4]                                             I choose character 4
+← [22,1793931360000,1793931660000]                  running until endsAt
+← [24,0,"1/2 + 1/2 = ?",["1","2","0","1/4"],30,1,30000]
+→ [6,1,1]                                           option 1
+← [25,1,1,19,1,0,19,0]                              right: +19 coins, streak 1
+→ [7,1,2]                                           open the third chest
+← [26,1,2,0,20,39,[5,20,0,40,0,20],null,0]          +20 coins; the others held a slip and +40
+← [24,2,"Pick the primes",[...],30,2,30000]         the next question
+→ [6,2,2]                                           wrong
+← [25,2,0,0,0,0,39,5,2500,"2 and 3 are prime"]     the right options, the explanation, a 2.5 s pause
+← [24,...,3,30000]                                  by itself, 2.5 s later
+← [28,[["Binh",2,130],["An",4,39],...],2,39]        the standings, every few seconds
+← [27,0,"Binh",12,27]                               Binh stole 12 of my coins
+```
+
+## What a player costs
+
+Measured by `quiz-bench --scenario quest` (see the README) with 300 simulated
+players answering every 6 to 10 seconds (70% right, a chest opened after 1 to 2.5
+s) over a steady window of 3 minutes:
+
+| per player | measured | budget |
+|---|---:|---:|
+| received per second | 75 B | 400 B |
+| frames received per second | 0.62 | 1.2 |
+| sent per answer (the answer, and the chest pick when it was right) | 23 B | 30 B |
+| frames sent per second | 0.17 | |
+| standings strips received per second | 0.32 (one every 3 s) | |
+
+The host's board goes out 2.0 times a second at most (272 B at the biggest, about
+530 B/s), the service used 0.5% of one core, and its memory went from 7.3 MiB idle
+to 10.0 MiB with 300 players in a game. A question is about 250 B, a verdict
+25 B (100 B with an explanation), a chest result about 45 B, the standings strip
+about 150 B.

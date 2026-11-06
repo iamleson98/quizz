@@ -47,6 +47,13 @@ LMS's own ids (text), opaque to this service.
   close will apply, so the provisional ranking is the final one. Players are
   never sent any of it while a question is open: a moving ranking would tell an
   unanswered student which option is right.
+- **Quest mode** is a second game: self-paced, with coins, treasure chests and
+  steals. Each student answers from their own shuffled queue; a right answer earns
+  coins and a pick of three hidden chests (coins, a jackpot, a booster, a shield, a
+  steal from a rival, a small loss); a wrong one costs a 2.5 s pause the server
+  enforces; the teacher watches a live board and the time runs out (5, 10 or 15
+  minutes). It is `[1,"quizId",1,seconds,flags]` on the same socket; see the
+  Quest section of [`PROTOCOL.md`](PROTOCOL.md).
 - Answer keys never leave the service before a question's reveal. When a
   question closes everybody gets a tiny `closed` frame at once, and the reveal
   follows after a 2.5 s beat (`REVEAL_DELAY_MS`; the host's `next` skips it), so
@@ -270,6 +277,7 @@ fails with `SQLITE_BUSY_SNAPSHOT` and is retried.
 │   │   ├── rest/                # the bank: handlers, bodies, OpenAPI
 │   │   ├── ws.rs                # one task per socket
 │   │   ├── game/                # rooms, frames, scoring, spans, registry
+│   │   │   └── quest/           # quest mode: state, chest odds, frames
 │   │   ├── repo/                # quizzes, games, the spans outbox
 │   │   ├── retention.rs         # the periods and the sweep
 │   │   ├── push.rs              # spans to the LMS server
@@ -307,6 +315,11 @@ cargo test
   origin / subprotocol / hello / ticket rules, socket, size and rate limits, and
   spans (ordering, batches of 500, idempotency, retry after a 503, drop on a
   404, shutdown flush, reconnect bridging).
+- `game/quest/tests.rs` runs quest mode under paused time with a scripted random
+  source: the queue and its reshuffle, coins and the streak bonus, the pause, a
+  missed question, every chest outcome and the odds by streak, steal targets and
+  shields, friendly mode, the floor at 0, the end and the one-transaction results,
+  every refusal, and that nothing of another player's question or chest leaks.
 - `tests/ops.rs` moves the service clock to test expiry (kept vs not kept, use
   moving it, viewing not, keeping switching 7 and 90 days, results expiring at 90
   days while the quiz stays, the startup sweep), forget, the internal listener
@@ -316,7 +329,9 @@ cargo test
 ## Benchmark
 
 `quiz-bench` plays a class against a running service over real sockets and
-reports the budgets the game is built for:
+reports the budgets the game is built for (`--scenario game` for the race, the
+default; `--scenario quest` for quest mode, with `--duration` seconds of steady
+window):
 
 ```bash
 export QUIZ_TICKET_KEY=...        # the service's key
@@ -344,6 +359,18 @@ at its default of 2), a typical question (80 characters, four options of 30):
 | write conflicts retried | 0 | 12 | |
 | host: one progress frame (counts and provisional top ten) | 254 B | 258 B | |
 | host: the one full-names frame after its hello | 4.5 KB (300) | 7.5 KB (500) | |
+
+**Quest mode** (`--scenario quest`, 300 simulated players answering every 6 to 10
+seconds for three minutes, 70% right, a chest opened after 1 to 2.5 s):
+
+| per player | measured | budget |
+|---|---:|---:|
+| received per second | 75 B | 400 B |
+| frames received per second | 0.62 | 1.2 |
+| sent per answer (answer and, when right, a chest pick) | 23 B | 30 B |
+| host board frames per second | 1.99 | 2 |
+| service CPU (share of one core) | 0.5% | 5% |
+| RSS idle / 300 sockets / during the game | 7.3 / 12.3 / 10.0 MiB | |
 
 A 120-character explanation adds about 120 B to what a player receives (539 B).
 Websocket permessage-deflate is not used: the websocket library the service
