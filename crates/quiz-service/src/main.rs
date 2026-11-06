@@ -1,7 +1,6 @@
 //! quiz-service entrypoint.
 
 use quiz_service::config::Config;
-use quiz_service::push::Pusher;
 use quiz_service::state::AppState;
 use quiz_service::{retention, server, snapshot, telemetry};
 use std::time::Duration;
@@ -10,8 +9,6 @@ use tracing::info;
 
 /// How long the service waits for rooms to close on shutdown.
 const SHUTDOWN_ROOMS_WITHIN: Duration = Duration::from_secs(5);
-/// How long the final push of lesson-time spans may take.
-const SHUTDOWN_PUSH_WITHIN: Duration = Duration::from_secs(3);
 
 fn main() {
     let cfg = match Config::from_env() {
@@ -61,11 +58,6 @@ async fn run(cfg: Config) -> Result<(), String> {
     quiz_service::db::spawn_size_gauge(cfg.database_path.clone());
     retention::spawn(state.clone());
     snapshot::spawn(state.clone());
-    // one pusher: it runs for the life of the process and flushes at the end
-    let pusher = Pusher::new(&state).map(std::sync::Arc::new);
-    if let Some(p) = &pusher {
-        tokio::spawn(p.clone().run());
-    }
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let serve = |listener: TcpListener,
@@ -96,11 +88,8 @@ async fn run(cfg: Config) -> Result<(), String> {
     ));
 
     shutdown_signal().await;
-    // Games end and their spans close before the sockets and the pusher go.
+    // Games end before the sockets go.
     state.rooms.shutdown(SHUTDOWN_ROOMS_WITHIN).await;
-    if let Some(p) = &pusher {
-        let _ = tokio::time::timeout(SHUTDOWN_PUSH_WITHIN, p.flush_once()).await;
-    }
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = public_task.await;

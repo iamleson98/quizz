@@ -42,7 +42,6 @@ async fn game_count(state: &AppState) -> i64 {
 async fn play_game(state: &AppState, quiz: &Value, host: &str) -> i64 {
     let store = DbStore {
         state: state.clone(),
-        spans_ready: state.spans_ready.clone(),
     };
     let quiz_id: i64 = quiz["id"].as_str().unwrap().parse().unwrap();
     let question_id: i64 = quiz["questions"][0]["id"]
@@ -225,7 +224,6 @@ async fn keeping_switches_the_period_both_ways_and_starting_a_game_is_a_use() {
     state.clock.advance_ms(5 * DAY);
     let store = DbStore {
         state: state.clone(),
-        spans_ready: state.spans_ready.clone(),
     };
     store
         .create_game(NewGame {
@@ -329,7 +327,6 @@ async fn the_sweep_runs_at_startup_and_closes_games_the_last_process_left_runnin
     // a game that never ended (the service died mid-lesson)
     let store = DbStore {
         state: state.clone(),
-        spans_ready: state.spans_ready.clone(),
     };
     store
         .create_game(NewGame {
@@ -547,71 +544,6 @@ async fn snapshots_are_atomic_and_the_gauge_advances_even_when_nothing_changed()
     assert!(snapshot_gauge() >= second + 15.0 * 60.0 - 1.0);
 }
 
-#[tokio::test]
-async fn orphaned_spans_are_closed_at_startup_and_a_forgotten_person_leaves_the_outbox() {
-    use quiz_service::repo::spans::{self, Span};
-    let state = setup().await;
-    let span = |user: &str, closed: bool, to: i64| Span {
-        game_id: 5,
-        user_id: user.into(),
-        session_id: "s1".into(),
-        role: "player".into(),
-        from_ms: 100,
-        to_ms: to,
-        closed,
-    };
-    let store = DbStore {
-        state: state.clone(),
-        spans_ready: state.spans_ready.clone(),
-    };
-    store
-        .write_spans(vec![
-            span("open-unsent", false, 500),
-            span("open-acked", false, 400),
-            span("student1", false, 300),
-        ])
-        .await
-        .unwrap();
-    // one of them was acknowledged up to its end already
-    sqlx::query("UPDATE spans_outbox SET pushed_ms = 400 WHERE user_id = 'open-acked'")
-        .execute(&state.pool)
-        .await
-        .unwrap();
-
-    retention::close_orphaned_games(&state, state.now_ms())
-        .await
-        .unwrap();
-    let pending = spans::pending(&state.pool, 10).await.unwrap();
-    let mut users: Vec<&str> = pending.iter().map(|s| s.user_id.as_str()).collect();
-    users.sort_unstable();
-    assert_eq!(users, vec!["open-unsent", "student1"]);
-    assert!(
-        pending.iter().all(|s| s.closed),
-        "their last heartbeat is their end"
-    );
-    assert_eq!(
-        spans::depth(&state.pool).await.unwrap(),
-        2,
-        "the acknowledged one left"
-    );
-
-    let internal = internal_router(state.clone(), telemetry::init_metrics());
-    call(
-        &internal,
-        "POST",
-        "/internal/users/student1/forget",
-        None,
-        None,
-        &[("x-internal-key", INTERNAL_KEY)],
-    )
-    .await;
-    assert_eq!(
-        spans::depth(&state.pool).await.unwrap(),
-        1,
-        "the forgotten person's spans are purged"
-    );
-}
-
 /// Poll `fut` exactly `polls` times, then drop it unfinished.
 async fn cancel_after<F: std::future::Future>(fut: F, polls: usize) {
     let mut fut = Box::pin(fut);
@@ -628,19 +560,20 @@ async fn a_write_transaction_that_is_dropped_midway_leaves_the_connection_clean(
     // one connection: whatever the cancelled write left behind, the next write
     // gets exactly that connection
     let state = setup_with(&[("QUIZ_POOL_MAX", "1".into()), ("QUIZ_POOL_MIN", "1".into())]).await;
+    sqlx::query("CREATE TABLE scratch (tag TEXT NOT NULL)")
+        .execute(&state.pool)
+        .await
+        .unwrap();
     let insert = |tag: String| {
         let state = state.clone();
         async move {
             quiz_service::tx::write_tx(&state, move |conn| {
                 let tag = tag.clone();
                 Box::pin(async move {
-                    sqlx::query(
-                        "INSERT INTO spans_outbox (game_id, user_id, session_id, role, from_ms, to_ms)
-                         VALUES (1, ?1, 's', 'player', 1, 2)",
-                    )
-                    .bind(tag)
-                    .execute(&mut *conn)
-                    .await?;
+                    sqlx::query("INSERT INTO scratch (tag) VALUES (?1)")
+                        .bind(tag)
+                        .execute(&mut *conn)
+                        .await?;
                     tokio::task::yield_now().await;
                     tokio::task::yield_now().await;
                     Ok(())
@@ -659,11 +592,10 @@ async fn a_write_transaction_that_is_dropped_midway_leaves_the_connection_clean(
             .unwrap_or_else(|e| panic!("the next write fails after a drop at poll {polls}: {e}"));
     }
     // and reads on that connection see the newest data, not an old snapshot
-    let after: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM spans_outbox WHERE user_id LIKE 'after%'")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scratch WHERE tag LIKE 'after%'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
     assert_eq!(after, 14, "every later write landed");
     let in_tx: bool = {
         let mut conn = state.pool.acquire().await.unwrap();

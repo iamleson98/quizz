@@ -1260,45 +1260,6 @@ async fn one_game_per_room_and_the_race_still_works_afterwards() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_spans_heartbeat_also_runs_while_a_quest_waits_in_the_lobby_and_on_the_podium() {
-    let q = Quest::new();
-    let p = q.player(1).await;
-    let mut h = q.host().await;
-    start(&h, 300, 0).await;
-    settle().await;
-    for _ in 0..3 {
-        adv(Duration::from_secs(61)).await;
-        h.frames();
-    }
-    let beats = |user: &str| {
-        q.w.store
-            .spans
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| s.user_id == user && !s.closed)
-            .count()
-    };
-    assert!(beats("teacher") >= 3, "the host, in the lobby");
-    assert!(beats("p1") >= 3, "and the player");
-
-    // on the podium after the time is up
-    h.send(ClientFrame::Next).await;
-    settle().await;
-    for _ in 0..5 {
-        adv(Duration::from_secs(61)).await;
-        h.frames();
-    }
-    let before = beats("teacher");
-    for _ in 0..3 {
-        adv(Duration::from_secs(61)).await;
-        h.frames();
-    }
-    assert!(beats("teacher") >= before + 3, "the podium too");
-    drop(p);
-}
-
-#[tokio::test(start_paused = true)]
 async fn an_answer_sooner_than_800_ms_after_the_question_is_refused_and_the_question_stays_open() {
     let q = Quest::new();
     let (_h, mut ps, cur) = running(&q, 1, 0).await;
@@ -1404,16 +1365,6 @@ fn ended_writes(q: &Quest) -> usize {
         .count()
 }
 
-fn closed_spans(q: &Quest) -> usize {
-    q.w.store
-        .spans
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|s| s.closed)
-        .count()
-}
-
 #[tokio::test(start_paused = true)]
 async fn ending_a_quest_in_play_shows_the_podium_stores_the_results_once_and_ends_on_the_next_end()
 {
@@ -1452,11 +1403,6 @@ async fn ending_a_quest_in_play_shows_the_podium_stores_the_results_once_and_end
     );
     assert!(last_of(&f, 7).is_none(), "not ended yet");
     assert_eq!(ended_writes(&q), 1, "stored when the podium opened");
-    assert_eq!(
-        closed_spans(&q),
-        0,
-        "the spans stay open until the game ends"
-    );
     // answers no longer count
     reply(&ps[2], &cur[2], right_mask(cur[2].id)).await;
     settle().await;
@@ -1467,10 +1413,6 @@ async fn ending_a_quest_in_play_shows_the_podium_stores_the_results_once_and_end
     settle().await;
     assert_eq!(last_of(&ps[0].frames(), 7).unwrap(), &json!([7, 0]));
     assert_eq!(ended_writes(&q), 1, "stored exactly once");
-    assert!(
-        closed_spans(&q) >= 4,
-        "host and three players: closed when the game ends"
-    );
     assert!(q.w.deps.rooms.running_quiz_ids().is_empty());
 }
 
@@ -1507,5 +1449,5 @@ async fn the_room_closing_or_idleness_during_the_podium_ends_a_quest_without_a_s
     }
     // an hour without a command: the end
     assert_eq!(ended_writes(&q), 1, "still one write");
-    assert!(closed_spans(&q) >= 3);
+    assert!(q.w.deps.rooms.running_quiz_ids().is_empty());
 }

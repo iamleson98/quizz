@@ -27,8 +27,6 @@ pub struct Deps {
     /// The service clock, unix ms.
     pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub rooms: Rooms,
-    /// Whether lesson-time spans are recorded.
-    pub track_spans: bool,
     /// A fresh random source for each quest game: a CSPRNG in the service, a
     /// seeded one in tests.
     pub quest_draw: Arc<dyn Fn() -> Box<dyn super::quest::chest::Draw> + Send + Sync>,

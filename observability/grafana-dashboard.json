@@ -249,41 +249,6 @@
       }
     },
     {
-      "id": 9,
-      "title": "Lesson-time spans: outbox depth, pushed and dropped per minute",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 32
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
-      "targets": [
-        {
-          "expr": "quiz_spans_outbox_depth",
-          "legendFormat": "outbox"
-        },
-        {
-          "expr": "rate(quiz_spans_pushed_total[5m]) * 60",
-          "legendFormat": "pushed / min"
-        },
-        {
-          "expr": "rate(quiz_spans_dropped_total[5m]) * 60",
-          "legendFormat": "dropped / min"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      }
-    },
-    {
       "id": 10,
       "title": "Snapshot age (seconds since the last interval)",
       "type": "timeseries",

@@ -1,24 +1,16 @@
-//! The game over real sockets: a running service, websocket clients and a
-//! fake Go server receiving lesson-time spans.
+//! The game over real sockets: a running service and websocket clients.
 
 mod common;
 
 use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post as route_post;
+use axum::http::StatusCode;
 use common::*;
 use futures::{SinkExt, StreamExt};
 use quiz_service::auth::Role;
-use quiz_service::game::store::{DbStore, GameStore};
-use quiz_service::push::Pusher;
-use quiz_service::repo::spans::{self, Span};
 use quiz_service::server::public_router;
 use quiz_service::state::AppState;
 use serde_json::{Value, json};
-use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -27,72 +19,6 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-// ------------------------------------------------------------ fake Go server
-
-#[derive(Default)]
-struct Fake {
-    requests: Vec<Value>,
-    keys: Vec<String>,
-    /// Answers (status and body) to give before falling back to 204.
-    script: VecDeque<(StatusCode, String)>,
-    /// A request naming one of these sessions is answered 404 with the id the
-    /// Go server uses for an unknown session.
-    unknown_sessions: HashSet<String>,
-}
-
-type FakeState = Arc<Mutex<Fake>>;
-
-async fn spans_route(
-    State(fake): State<FakeState>,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<Value>,
-) -> (StatusCode, String) {
-    let mut f = fake.lock().unwrap();
-    f.keys.push(
-        headers
-            .get("x-internal-key")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string(),
-    );
-    let unknown = body["spans"].as_array().unwrap().iter().any(|s| {
-        f.unknown_sessions
-            .contains(s["session_id"].as_str().unwrap())
-    });
-    f.requests.push(body);
-    if let Some(answer) = f.script.pop_front() {
-        return answer;
-    }
-    if unknown {
-        (StatusCode::NOT_FOUND, session_unknown_body())
-    } else {
-        (StatusCode::NO_CONTENT, String::new())
-    }
-}
-
-fn session_unknown_body() -> String {
-    json!({ "id": quiz_service::push::SESSION_UNKNOWN, "message": "no such session" }).to_string()
-}
-
-/// Make the fake answer the next request with this status and body.
-fn answer_next(fake: &FakeState, status: StatusCode, body: &str) {
-    fake.lock()
-        .unwrap()
-        .script
-        .push_back((status, body.to_string()));
-}
-
-async fn fake_go() -> (String, FakeState) {
-    let fake = FakeState::default();
-    let app = Router::new()
-        .route("/api/v4/lms/internal/quiz/spans", route_post(spans_route))
-        .with_state(fake.clone());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    (format!("http://{addr}"), fake)
-}
 
 // -------------------------------------------------------------- the service
 
@@ -242,9 +168,8 @@ fn player_ticket(s: &Service, sub: &str) -> String {
 // ------------------------------------------------------------------ the game
 
 #[tokio::test]
-async fn a_whole_game_over_real_sockets_is_scored_stored_and_billed_as_time() {
-    let (lms, fake) = fake_go().await;
-    let s = serve(&[("QUIZ_LMS_URL", lms)]).await;
+async fn a_whole_game_over_real_sockets_is_scored_and_stored() {
+    let s = serve(&[]).await;
     let quiz_id = s.quiz("teacher1").await;
 
     let (mut host, first) = s.join(&host_ticket(&s, "teacher1")).await;
@@ -319,7 +244,7 @@ async fn a_whole_game_over_real_sockets_is_scored_stored_and_billed_as_time() {
     send(&mut host, json!([3])).await;
     assert_eq!(recv_kind(&mut players[0], 7).await, json!([7, 0]));
 
-    // the results are in the bank, the spans in the outbox
+    // the results are in the bank
     let t = ticket(&s.state, Role::Teacher, "teacher1");
     let games = get(&s.router, &format!("/v1/quizzes/{quiz_id}/games"), &t)
         .await
@@ -337,41 +262,11 @@ async fn a_whole_game_over_real_sockets_is_scored_stored_and_billed_as_time() {
         answers, 5,
         "three answers to question 1, one each to 2 and 3"
     );
-
-    let pusher = Pusher::new(&s.state).unwrap();
-    assert!(pusher.drain(false).await);
-    let sent: Vec<Value> = fake
-        .lock()
-        .unwrap()
-        .requests
-        .iter()
-        .flat_map(|r| r["spans"].as_array().unwrap().clone())
-        .collect();
-    let users: HashSet<&str> = sent
-        .iter()
-        .map(|x| x["user_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        users,
-        HashSet::from(["teacher1", "student1", "student2", "student3"])
-    );
-    let mine = sent.iter().find(|x| x["user_id"] == "teacher1").unwrap();
-    assert_eq!(mine["role"], "host");
-    assert_eq!(mine["session_id"], "s1");
-    assert!(mine["game_id"].as_str().unwrap().parse::<i64>().is_ok());
-    assert!(mine["to"].as_i64().unwrap() >= mine["from"].as_i64().unwrap());
-    assert_eq!(fake.lock().unwrap().keys[0], INTERNAL_KEY);
-    assert_eq!(
-        spans::depth(&s.state.pool).await.unwrap(),
-        0,
-        "acknowledged spans leave the outbox"
-    );
 }
 
 #[tokio::test]
-async fn a_reconnect_resumes_the_game_and_extends_the_same_span() {
-    let (lms, fake) = fake_go().await;
-    let s = serve(&[("QUIZ_LMS_URL", lms)]).await;
+async fn a_reconnect_resumes_the_game() {
+    let s = serve(&[]).await;
     let quiz_id = s.quiz("teacher1").await;
     let (mut host, _) = s.join(&host_ticket(&s, "teacher1")).await;
     let ptoken = player_ticket(&s, "student1");
@@ -402,21 +297,6 @@ async fn a_reconnect_resumes_the_game_and_extends_the_same_span() {
     send(&mut host, json!([3])).await;
     send(&mut host, json!([3])).await; // the podium first, then the end
     recv_kind(&mut again, 7).await;
-
-    let pusher = Pusher::new(&s.state).unwrap();
-    assert!(pusher.drain(false).await);
-    let sent: Vec<Value> = fake
-        .lock()
-        .unwrap()
-        .requests
-        .iter()
-        .flat_map(|r| r["spans"].as_array().unwrap().clone())
-        .collect();
-    assert_eq!(
-        sent.iter().filter(|x| x["user_id"] == "student1").count(),
-        1,
-        "one span, not two"
-    );
 }
 
 #[tokio::test]
@@ -518,282 +398,9 @@ impl IntoPair for (Ws, Value) {
     }
 }
 
-// ------------------------------------------------------------------- spans
-
-fn span(user: &str, session: &str, from: i64, to: i64, closed: bool) -> Span {
-    Span {
-        game_id: 77,
-        user_id: user.into(),
-        session_id: session.into(),
-        role: "player".into(),
-        from_ms: from,
-        to_ms: to,
-        closed,
-    }
-}
-
-fn store(state: &AppState) -> DbStore {
-    DbStore {
-        state: state.clone(),
-        spans_ready: state.spans_ready.clone(),
-    }
-}
-
-fn sent(fake: &FakeState) -> Vec<Value> {
-    fake.lock()
-        .unwrap()
-        .requests
-        .iter()
-        .flat_map(|r| r["spans"].as_array().unwrap().clone())
-        .collect()
-}
-
 #[tokio::test]
-async fn spans_are_pushed_in_order_in_batches_of_500_and_idempotently() {
-    let (lms, fake) = fake_go().await;
-    let state = setup_with(&[("QUIZ_LMS_URL", lms)]).await;
-    let list: Vec<Span> = (0..1200)
-        .map(|i| span(&format!("u{i:04}"), "s1", 1_000 + i, 2_000 + i, true))
-        .collect();
-    store(&state).write_spans(list.clone()).await.unwrap();
-    // writing the same spans again changes nothing
-    store(&state).write_spans(list).await.unwrap();
-    assert_eq!(spans::depth(&state.pool).await.unwrap(), 1200);
-
-    let pusher = Pusher::new(&state).unwrap();
-    assert!(pusher.drain(false).await);
-    let sizes: Vec<usize> = fake
-        .lock()
-        .unwrap()
-        .requests
-        .iter()
-        .map(|r| r["spans"].as_array().unwrap().len())
-        .collect();
-    assert_eq!(sizes, vec![500, 500, 200]);
-    let froms: Vec<i64> = sent(&fake)
-        .iter()
-        .map(|x| x["from"].as_i64().unwrap())
-        .collect();
-    assert!(froms.windows(2).all(|w| w[0] <= w[1]), "oldest first");
-    assert_eq!(spans::depth(&state.pool).await.unwrap(), 0);
-
-    // nothing left to send: no request at all
-    assert!(pusher.drain(false).await);
-    assert_eq!(fake.lock().unwrap().requests.len(), 3);
-}
-
-#[tokio::test]
-async fn a_hosts_open_span_is_resent_with_a_later_end_and_leaves_when_closed() {
-    let (lms, fake) = fake_go().await;
-    let state = setup_with(&[("QUIZ_LMS_URL", lms)]).await;
-    let pusher = Pusher::new(&state).unwrap();
-    let st = store(&state);
-
-    st.write_spans(vec![span("h", "s1", 1_000, 61_000, false)])
-        .await
-        .unwrap();
-    pusher.drain(false).await;
-    assert_eq!(
-        spans::depth(&state.pool).await.unwrap(),
-        1,
-        "an open span stays"
-    );
-    pusher.drain(false).await;
-    assert_eq!(
-        fake.lock().unwrap().requests.len(),
-        1,
-        "nothing new to say yet"
-    );
-
-    st.write_spans(vec![span("h", "s1", 1_000, 121_000, false)])
-        .await
-        .unwrap();
-    pusher.drain(false).await;
-    // an older end arriving late never shrinks it
-    st.write_spans(vec![span("h", "s1", 1_000, 90_000, false)])
-        .await
-        .unwrap();
-    pusher.drain(false).await;
-    assert_eq!(fake.lock().unwrap().requests.len(), 2);
-    let tos: Vec<i64> = sent(&fake)
-        .iter()
-        .map(|x| x["to"].as_i64().unwrap())
-        .collect();
-    assert_eq!(tos, vec![61_000, 121_000], "the end only grows");
-
-    st.write_spans(vec![span("h", "s1", 1_000, 130_000, true)])
-        .await
-        .unwrap();
-    pusher.drain(false).await;
-    assert_eq!(
-        spans::depth(&state.pool).await.unwrap(),
-        0,
-        "closed and acknowledged: gone"
-    );
-}
-
-#[tokio::test]
-async fn spans_are_retried_after_a_503_and_dropped_only_for_an_unknown_session() {
-    quiz_service::telemetry::init_metrics();
-    let (lms, fake) = fake_go().await;
-    let state = setup_with(&[("QUIZ_LMS_URL", lms)]).await;
-    let pusher = Pusher::new(&state).unwrap();
-    let st = store(&state);
-
-    // 503: kept, and sent again once the server recovers
-    answer_next(&fake, StatusCode::SERVICE_UNAVAILABLE, "");
-    st.write_spans(vec![span("a", "s1", 1, 2, true)])
-        .await
-        .unwrap();
-    assert!(
-        !pusher.drain(false).await,
-        "a failing server is not success"
-    );
-    assert_eq!(
-        spans::depth(&state.pool).await.unwrap(),
-        1,
-        "still in the outbox"
-    );
-    let started = std::time::Instant::now();
-    answer_next(&fake, StatusCode::BAD_GATEWAY, "");
-    assert!(
-        pusher.drain(true).await,
-        "with retry it waits (backoff) and gets through"
-    );
-    assert!(
-        started.elapsed() >= Duration::from_millis(700),
-        "it backed off before retrying"
-    );
-    assert_eq!(spans::depth(&state.pool).await.unwrap(), 0);
-
-    // 404 for an unknown session: that span is dropped, the others in the
-    // same batch still get through
-    fake.lock().unwrap().unknown_sessions.insert("ghost".into());
-    st.write_spans(vec![
-        span("b", "s1", 10, 20, true),
-        span("c", "ghost", 11, 21, true),
-        span("d", "s2", 12, 22, true),
-    ])
-    .await
-    .unwrap();
-    assert!(pusher.drain(true).await);
-    assert_eq!(
-        spans::depth(&state.pool).await.unwrap(),
-        0,
-        "the refused span did not stay"
-    );
-    let accepted: HashSet<String> = sent(&fake)
-        .iter()
-        .map(|x| x["user_id"].as_str().unwrap().to_string())
-        .collect();
-    assert!(accepted.contains("b") && accepted.contains("d"));
-    let metrics = quiz_service::telemetry::init_metrics().render();
-    assert!(metrics.contains("quiz_spans_dropped_total"), "{metrics}");
-    assert!(metrics.contains("quiz_spans_pushed_total"));
-    assert!(metrics.contains("quiz_spans_outbox_depth"));
-}
-
-#[tokio::test]
-async fn a_refusal_that_may_pass_never_loses_a_span() {
-    let (lms, fake) = fake_go().await;
-    let state = setup_with(&[("QUIZ_LMS_URL", lms)]).await;
-    let pusher = Pusher::new(&state).unwrap();
-    let st = store(&state);
-    st.write_spans(vec![
-        span("a", "s1", 1, 2, true),
-        span("b", "s1", 3, 4, true),
-    ])
-    .await
-    .unwrap();
-
-    // 401 (the feature is off or the keys differ), 403, 429 (rate limited), an
-    // old server with no route (404 without the error id), 408, 5xx: the outbox
-    // is untouched
-    for (status, body) in [
-        (StatusCode::UNAUTHORIZED, ""),
-        (StatusCode::FORBIDDEN, ""),
-        (StatusCode::TOO_MANY_REQUESTS, ""),
-        (StatusCode::NOT_FOUND, ""),
-        (
-            StatusCode::NOT_FOUND,
-            r#"{"id":"api.context.404.app_error"}"#,
-        ),
-        (StatusCode::REQUEST_TIMEOUT, ""),
-        (StatusCode::INTERNAL_SERVER_ERROR, ""),
-    ] {
-        answer_next(&fake, status, body);
-        assert!(!pusher.drain(false).await, "{status} is not success");
-        assert_eq!(
-            spans::depth(&state.pool).await.unwrap(),
-            2,
-            "{status} kept the spans"
-        );
-    }
-    assert_eq!(
-        fake.lock().unwrap().requests.len(),
-        7,
-        "each one was one whole batch, not split"
-    );
-
-    // a 429 is waited out with backoff and then goes through
-    answer_next(&fake, StatusCode::TOO_MANY_REQUESTS, "");
-    let started = std::time::Instant::now();
-    assert!(pusher.drain(true).await);
-    assert!(
-        started.elapsed() >= Duration::from_millis(700),
-        "it backed off"
-    );
-    assert_eq!(spans::depth(&state.pool).await.unwrap(), 0);
-}
-
-#[tokio::test]
-async fn a_malformed_batch_is_dropped_and_the_span_of_an_unknown_session_alone() {
-    let (lms, fake) = fake_go().await;
-    let state = setup_with(&[("QUIZ_LMS_URL", lms)]).await;
-    let pusher = Pusher::new(&state).unwrap();
-    let st = store(&state);
-    // 400, 413 and 422 mean the server will never take this
-    for status in [
-        StatusCode::BAD_REQUEST,
-        StatusCode::PAYLOAD_TOO_LARGE,
-        StatusCode::UNPROCESSABLE_ENTITY,
-    ] {
-        st.write_spans(vec![span("x", "s1", 1, 2, true)])
-            .await
-            .unwrap();
-        fake.lock()
-            .unwrap()
-            .script
-            .push_back((status, String::new()));
-        assert!(pusher.drain(false).await, "{status}");
-        assert_eq!(
-            spans::depth(&state.pool).await.unwrap(),
-            0,
-            "{status} dropped it"
-        );
-    }
-    // a batch with one span of an unknown session: only that one goes
-    fake.lock().unwrap().unknown_sessions.insert("ghost".into());
-    st.write_spans(vec![
-        span("good1", "s1", 10, 20, true),
-        span("bad", "ghost", 11, 21, true),
-        span("good2", "s1", 12, 22, true),
-    ])
-    .await
-    .unwrap();
-    assert!(pusher.drain(false).await);
-    assert_eq!(spans::depth(&state.pool).await.unwrap(), 0);
-    let accepted: HashSet<String> = sent(&fake)
-        .iter()
-        .map(|x| x["user_id"].as_str().unwrap().to_string())
-        .collect();
-    assert!(accepted.contains("good1") && accepted.contains("good2"));
-}
-
-#[tokio::test]
-async fn shutdown_closes_every_open_span_and_makes_one_last_push() {
-    let (lms, fake) = fake_go().await;
-    let s = serve(&[("QUIZ_LMS_URL", lms)]).await;
+async fn shutdown_ends_a_running_game_and_closes_it_in_the_database() {
+    let s = serve(&[]).await;
     let quiz_id = s.quiz("teacher1").await;
     let (mut host, _) = s.join(&host_ticket(&s, "teacher1")).await;
     let (mut p, _) = s.join(&player_ticket(&s, "student1")).await;
@@ -807,16 +414,6 @@ async fn shutdown_closes_every_open_span_and_makes_one_last_push() {
         recv_kind(&mut p, 7).await,
         json!([7, 3]),
         "the game ended because the service restarts"
-    );
-    let pusher = Pusher::new(&s.state).unwrap();
-    pusher.flush_once().await;
-    let users: HashSet<String> = sent(&fake)
-        .iter()
-        .map(|x| x["user_id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(
-        users,
-        HashSet::from(["teacher1".to_string(), "student1".to_string()])
     );
     let ended: Option<i64> = sqlx::query_scalar("SELECT ended_at FROM games")
         .fetch_one(&s.state.pool)

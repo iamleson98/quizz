@@ -1,11 +1,10 @@
-//! The live game: rooms, frames, scoring and lesson-time spans.
+//! The live game: rooms, frames and scoring.
 
 pub mod frames;
 pub mod quest;
 pub mod registry;
 pub mod room;
 pub mod scoring;
-pub mod spans;
 pub mod store;
 
 pub use registry::{Deps, Rooms};

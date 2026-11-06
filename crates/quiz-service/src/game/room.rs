@@ -12,7 +12,6 @@
 use super::frames::{self, ClientFrame, EndReason, Out, Tail};
 use super::registry::Deps;
 use super::scoring::{points_for, streak_bonus};
-use super::spans::SpanBook;
 use crate::auth::Role;
 use crate::error::{AppError, AppResult};
 use crate::grading::grade_question;
@@ -20,7 +19,6 @@ use crate::ids::new_id;
 use crate::model::{QuestionKind, QuestionWithOptions};
 use crate::repo::games::{AnswerWrite, Batch, NewGame, PlayerWrite};
 use crate::repo::quizzes::limits::MAX_PLAYERS_PER_GAME;
-use crate::repo::spans::Span;
 use axum::extract::ws::Utf8Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -270,7 +268,6 @@ pub struct Room {
     game: Option<Game>,
     /// The quest game, when this room plays one instead of a race.
     pub(super) quest: Option<super::quest::Quest>,
-    pub(super) spans: SpanBook,
     pub(super) wall0: i64,
     pub(super) t0: Instant,
     /// Sockets to drop after the current command (too slow or gone).
@@ -293,7 +290,6 @@ pub fn spawn(deps: Deps, sid: String, id: u64) -> RoomHandle {
         socks: HashMap::new(),
         game: None,
         quest: None,
-        spans: SpanBook::default(),
         t0: now,
         slow: Vec::new(),
         progress_dirty: false,
@@ -354,7 +350,6 @@ impl Room {
             g.map(|g| g.rc_at),
             g.map(|g| g.idle_at),
             self.flush_at,
-            g.map(|_| self.spans.next_tick),
             self.quest_next_wake(),
         ]
         .into_iter()
@@ -387,10 +382,6 @@ impl Room {
             } else if now >= g.idle_at {
                 self.finish(EndReason::Idle).await;
             }
-        }
-        if self.game.is_some() && now >= self.spans.next_tick {
-            let due = self.spans.tick(self.wall(now), now);
-            self.write_spans(due).await;
         }
         self.quest_on_timer().await;
     }
@@ -482,7 +473,6 @@ impl Room {
                 Role::Player => pid = Some(join(g, &m.user, &m.name, wall)?),
                 _ => {}
             }
-            self.spans.attach(&m.user, m.role, wall);
         }
         if m.role == Role::Player {
             metrics::gauge!("quiz_players_connected").increment(1.0);
@@ -517,21 +507,16 @@ impl Room {
         let Some(s) = self.socks.remove(&sock) else {
             return;
         };
-        let now = Instant::now();
-        let wall = self.wall(now);
         let mut question_may_close = false;
-        if let Some(g) = &mut self.game {
-            self.spans.detach(&s.user, wall, now);
-            if let Some(pid) = s.pid {
-                let p = &mut g.players[pid];
-                p.live = p.live.saturating_sub(1);
-                if p.live == 0 {
-                    if g.phase == Phase::Lobby && p.active {
-                        p.active = false;
-                        g.active_count -= 1;
-                    }
-                    question_may_close = g.phase == Phase::Question;
+        if let (Some(g), Some(pid)) = (&mut self.game, s.pid) {
+            let p = &mut g.players[pid];
+            p.live = p.live.saturating_sub(1);
+            if p.live == 0 {
+                if g.phase == Phase::Lobby && p.active {
+                    p.active = false;
+                    g.active_count -= 1;
                 }
+                question_may_close = g.phase == Phase::Question;
             }
         }
         if s.pid.is_some() {
@@ -727,7 +712,6 @@ impl Room {
             stored: false,
             podium: None,
         };
-        self.spans.begin(id, &self.sid, self.deps.track_spans, now);
         // Everyone already in the room is in the game.
         // (in the order they arrived, so "who joined first" means something)
         let mut full = Vec::new();
@@ -737,7 +721,6 @@ impl Room {
             let Some(s) = self.socks.get_mut(&sid) else {
                 continue;
             };
-            self.spans.attach(&s.user, s.role, wall);
             if s.role == Role::Player {
                 match join(&mut game, &s.user, &s.name, wall) {
                     Ok(pid) => s.pid = Some(pid),
@@ -1230,8 +1213,7 @@ impl Room {
         }
     }
 
-    /// End the game: write everything that is left, close the spans, tell
-    /// everyone. The sockets stay: the room can host another game.
+    /// End the game: write everything that is left, tell everyone. The sockets stay: the room can host another game.
     pub(super) async fn finish(&mut self, reason: EndReason) {
         if self.quest.is_some() {
             return self.quest_finish(reason).await;
@@ -1252,8 +1234,6 @@ impl Room {
         if !self.game.as_ref().is_some_and(|g| g.stored) {
             self.persist(Some(ended_at)).await;
         }
-        let closed = self.spans.close_all(ended_at);
-        self.write_spans(closed).await;
         self.game = None;
         for s in self.socks.values_mut() {
             s.pid = None;
@@ -1309,27 +1289,6 @@ impl Room {
                     g.pending = batch.answers;
                 }
                 false
-            }
-        }
-    }
-
-    pub(super) async fn write_spans(&self, spans: Vec<Span>) {
-        if spans.is_empty() {
-            return;
-        }
-        // lesson time must not be lost to a busy moment: try twice, and say
-        // loudly (log and counter) when the outbox cannot take them
-        for attempt in 1..=2 {
-            match self.deps.store.write_spans(spans.clone()).await {
-                Ok(()) => return,
-                Err(e) if attempt == 1 => {
-                    tracing::warn!(error = %e, "writing lesson-time spans failed, trying again");
-                }
-                Err(e) => {
-                    metrics::counter!("quiz_spans_write_failures_total")
-                        .increment(spans.len() as u64);
-                    tracing::error!(error = %e, spans = spans.len(), "writing lesson-time spans failed twice: they are lost");
-                }
             }
         }
     }

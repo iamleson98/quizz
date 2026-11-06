@@ -35,7 +35,6 @@ pub fn config_with(extra: &[(&str, String)]) -> Config {
         ("QUIZ_INTERNAL_KEY".into(), INTERNAL_KEY.into()),
         ("QUIZ_ALLOWED_ORIGINS".into(), SITE.into()),
         ("QUIZ_SNAPSHOT_DIR".into(), String::new()),
-        ("QUIZ_LMS_URL".into(), String::new()),
         // tests write a lot: the limiter has its own test
         ("QUIZ_BANK_WRITE_BURST".into(), "1000000".into()),
         ("QUIZ_BANK_WRITES_PER_MINUTE".into(), "1000000".into()),

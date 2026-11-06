@@ -5,13 +5,11 @@
 use crate::error::AppResult;
 use crate::model::QuestionWithOptions;
 use crate::repo::games::{Batch, NewGame};
-use crate::repo::spans::Span;
-use crate::repo::{games, quizzes, spans};
+use crate::repo::{games, quizzes};
 use crate::state::AppState;
 use crate::tx;
 use futures::future::BoxFuture;
 use std::sync::Arc;
-use tokio::sync::Notify;
 
 /// A quiz as a game plays it.
 #[derive(Clone, Debug)]
@@ -28,15 +26,11 @@ pub trait GameStore: Send + Sync + 'static {
     fn create_game(&self, game: NewGame) -> BoxFuture<'_, AppResult<()>>;
     /// Write players and answers (and the end of the game when asked).
     fn write(&self, batch: Batch) -> BoxFuture<'_, AppResult<()>>;
-    /// Put spans in the outbox.
-    fn write_spans(&self, spans: Vec<Span>) -> BoxFuture<'_, AppResult<()>>;
 }
 
 /// The store over the service's SQLite.
 pub struct DbStore {
     pub state: AppState,
-    /// Woken when the outbox has something new for the pusher.
-    pub spans_ready: Arc<Notify>,
 }
 
 impl GameStore for DbStore {
@@ -69,23 +63,6 @@ impl GameStore for DbStore {
                 Box::pin(async move { games::write_batch(conn, &batch).await })
             })
             .await
-        })
-    }
-
-    fn write_spans(&self, list: Vec<Span>) -> BoxFuture<'_, AppResult<()>> {
-        Box::pin(async move {
-            tx::write_tx(&self.state, move |conn| {
-                let list = list.clone();
-                Box::pin(async move {
-                    for s in &list {
-                        spans::upsert(conn, s).await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await?;
-            self.spans_ready.notify_one();
-            Ok(())
         })
     }
 }

@@ -8,7 +8,7 @@ use jsonwebtoken::DecodingKey;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 pub struct AppStateInner {
     pub cfg: Config,
@@ -21,8 +21,6 @@ pub struct AppStateInner {
     pub rooms: Rooms,
     /// What a room needs; set once the state exists.
     deps: OnceLock<Deps>,
-    /// Woken when the spans outbox has something new to push.
-    pub spans_ready: Arc<Notify>,
     pub clock: Clock,
     /// Limits the bank's writes per person.
     pub write_limiter: crate::ratelimit::Limiter,
@@ -57,7 +55,6 @@ impl AppState {
             commit_mutex: Mutex::new(()),
             rooms: Rooms::default(),
             deps: OnceLock::new(),
-            spans_ready: Arc::new(Notify::new()),
             clock: Clock::default(),
             write_limiter,
             sqlite_version,
@@ -68,11 +65,9 @@ impl AppState {
         let _ = state.deps.set(Deps {
             store: Arc::new(DbStore {
                 state: state.clone(),
-                spans_ready: state.spans_ready.clone(),
             }),
             now_ms: Arc::new(move || clock_state.now_ms()),
             rooms: state.rooms.clone(),
-            track_spans: state.cfg.lms_url.is_some(),
             quest_draw: Arc::new(|| Box::new(crate::game::quest::chest::SystemDraw)),
         });
         Ok(state)

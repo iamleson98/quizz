@@ -10,7 +10,6 @@ use crate::error::{AppError, AppResult};
 use crate::grading::tests::question;
 use crate::model::QuestionKind;
 use crate::repo::games::{Batch, NewGame};
-use crate::repo::spans::Span;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -27,10 +26,7 @@ pub(crate) struct FakeStore {
     pub(crate) quizzes: Mutex<HashMap<(i64, String), LoadedQuiz>>,
     pub(crate) games: Mutex<Vec<NewGame>>,
     pub(crate) batches: Mutex<Vec<Batch>>,
-    pub(crate) spans: Mutex<Vec<Span>>,
     pub(crate) fail_writes: Mutex<bool>,
-    /// How many of the next span writes fail.
-    pub(crate) fail_span_writes: Mutex<u32>,
 }
 
 impl GameStore for FakeStore {
@@ -56,17 +52,6 @@ impl GameStore for FakeStore {
                 return Err(AppError::Internal("disk".into()));
             }
             self.batches.lock().unwrap().push(batch);
-            Ok(())
-        })
-    }
-    fn write_spans(&self, spans: Vec<Span>) -> BoxFuture<'_, AppResult<()>> {
-        Box::pin(async move {
-            let mut failing = self.fail_span_writes.lock().unwrap();
-            if *failing > 0 {
-                *failing -= 1;
-                return Err(AppError::Internal("busy".into()));
-            }
-            self.spans.lock().unwrap().extend(spans);
             Ok(())
         })
     }
@@ -118,7 +103,6 @@ pub(crate) fn world_with(
         store: store.clone(),
         now_ms: Arc::new(|| BASE),
         rooms: Rooms::default(),
-        track_spans: true,
         quest_draw,
     };
     World { store, deps }
@@ -727,46 +711,6 @@ async fn at_most_500_players_and_a_slow_socket_is_cut() {
         ),
         "the unread socket was cut"
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn spans_follow_who_was_connected() {
-    let w = world();
-    let p = player(&w, 1).await;
-    let h = host(&w).await;
-    h.send(ClientFrame::Start(1)).await;
-    settle().await;
-    adv(Duration::from_secs(30)).await;
-    let leaver = player(&w, 2).await;
-    adv(Duration::from_secs(30)).await;
-    leaver.room.detach(leaver.sock).await;
-    settle().await;
-    for _ in 0..5 {
-        adv(Duration::from_secs(60)).await;
-    }
-    h.send(ClientFrame::End).await;
-    settle().await;
-    let spans = w.store.spans.lock().unwrap().clone();
-    let closed: Vec<_> = spans.iter().filter(|s| s.closed).collect();
-    assert_eq!(
-        closed.len(),
-        3,
-        "host, p1 and p2 each have one closed span: {spans:?}"
-    );
-    let p2 = closed.iter().find(|s| s.user_id == "p2").unwrap();
-    assert!(
-        (30_000..30_100).contains(&(p2.to_ms - p2.from_ms)),
-        "closed at the moment they left: {spans:?}"
-    );
-    let host_open = spans
-        .iter()
-        .filter(|s| !s.closed && s.role == "host")
-        .count();
-    assert!(
-        host_open >= 4,
-        "the host's open span was rewritten each minute"
-    );
-    drop(p);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1389,37 +1333,6 @@ async fn the_host_keeps_seeing_the_provisional_ranking_until_the_reveal() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn every_connected_person_is_rewritten_each_minute_and_a_failed_write_is_retried() {
-    let w = world();
-    let p1 = player(&w, 1).await;
-    let h = host(&w).await;
-    h.send(ClientFrame::Start(1)).await;
-    settle().await;
-    for _ in 0..3 {
-        adv(Duration::from_secs(61)).await;
-    }
-    {
-        let spans = w.store.spans.lock().unwrap();
-        for user in ["teacher", "p1"] {
-            let beats = spans
-                .iter()
-                .filter(|s| s.user_id == user && !s.closed)
-                .count();
-            assert!(beats >= 3, "{user} was written {beats} times: {spans:?}");
-        }
-    }
-    // the outbox is busy once: the write is tried again
-    *w.store.fail_span_writes.lock().unwrap() = 1;
-    let before = w.store.spans.lock().unwrap().len();
-    adv(Duration::from_secs(61)).await;
-    assert!(
-        w.store.spans.lock().unwrap().len() > before,
-        "the retry got them in"
-    );
-    drop(p1);
-}
-
-#[tokio::test(start_paused = true)]
 async fn an_answer_is_timed_from_when_the_socket_received_it() {
     let w = world();
     let mut a = player(&w, 1).await;
@@ -1475,16 +1388,6 @@ fn stored_answers(w: &World) -> usize {
         .iter()
         .map(|b| b.answers.len())
         .sum()
-}
-
-fn closed_spans(w: &World) -> usize {
-    w.store
-        .spans
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|s| s.closed)
-        .count()
 }
 
 /// A race with a host and three players, question 1 open, p1 right and p2
@@ -1545,7 +1448,6 @@ async fn ending_a_race_during_a_question_closes_it_shows_the_podium_and_ends_on_
         "the open question's answers were stored"
     );
     assert_eq!(ended_writes(&w), 1, "the results are stored once, now");
-    assert_eq!(closed_spans(&w), 0, "spans stay open until the game ends");
     // answers no longer count
     answer(&ps[2], 1, 0b0010).await;
     settle().await;
@@ -1557,10 +1459,6 @@ async fn ending_a_race_during_a_question_closes_it_shows_the_podium_and_ends_on_
     assert_eq!(last_of(&ps[0].frames(), 7).unwrap(), &json!([7, 0]));
     assert_eq!(ended_writes(&w), 1, "still stored exactly once");
     assert_eq!(stored_answers(&w), 2);
-    assert!(
-        closed_spans(&w) >= 4,
-        "host and three players closed at the end"
-    );
     assert!(w.deps.rooms.running_quiz_ids().is_empty());
     // nothing to end any more
     h.send(ClientFrame::End).await;
@@ -1626,7 +1524,6 @@ async fn ending_a_race_in_the_lobby_ends_it_at_once() {
     assert_eq!(last_of(&f, 7).unwrap(), &json!([7, 0]));
     assert!(last_of(&f, 6).is_none(), "nothing was played: no podium");
     assert_eq!(ended_writes(&w), 1);
-    assert!(closed_spans(&w) >= 2);
     h.frames();
 }
 
@@ -1647,6 +1544,5 @@ async fn the_race_podium_ends_by_itself_after_an_hour_with_one_write() {
         1,
         "the idle end does not store a second time"
     );
-    assert!(closed_spans(&w) >= 4);
     assert!(w.deps.rooms.running_quiz_ids().is_empty());
 }
