@@ -1,0 +1,1196 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Quiz service: the bank",
+    "description": "Authoring and listing quizzes, keeping them, and reading the results of finished games. The live game itself is the websocket in PROTOCOL.md.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/quizzes": {
+      "get": {
+        "tags": [
+          "quizzes"
+        ],
+        "summary": "List the caller's quizzes, newest first.",
+        "operationId": "listQuizzes",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Quizzes to skip (default 0).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0,
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the bank",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuizList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The ticket's role has no bank",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "quizzes"
+        ],
+        "summary": "Create a quiz with all its questions.",
+        "operationId": "createQuiz",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateQuizBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The new quiz",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Quiz"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The ticket's role has no bank",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The bank is full (200 quizzes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body too large, or the quizzes would hold more than 20 MB of text (code QUOTA_EXCEEDED)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input; `fields` says where",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/quizzes/{id}": {
+      "get": {
+        "tags": [
+          "quizzes"
+        ],
+        "summary": "Read a quiz with its answer keys.",
+        "operationId": "getQuiz",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Quiz id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The quiz; carries an ETag",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Weak validator; send it back in If-None-Match"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Quiz"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Unchanged since the ETag in If-None-Match"
+          },
+          "401": {
+            "description": "No valid ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The ticket's role has no bank",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such quiz of yours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "quizzes"
+        ],
+        "summary": "Save the whole quiz: title, description and every question at once.",
+        "operationId": "updateQuiz",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Quiz id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateQuizBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The saved quiz",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Quiz"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The ticket's role has no bank",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such quiz of yours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A game is running on this quiz",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body too large, or the quizzes would hold more than 20 MB of text (code QUOTA_EXCEEDED)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid input; `fields` says where",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "quizzes"
+        ],
+        "summary": "Delete a quiz and its games at once.",
+        "operationId": "deleteQuiz",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Quiz id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "No valid ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The ticket's role has no bank",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such quiz of yours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A game is running on this quiz",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/quizzes/{id}/games": {
+      "get": {
+        "tags": [
+          "quizzes"
+        ],
+        "summary": "The results of a quiz's finished games, newest first.",
+        "operationId": "listQuizGames",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Quiz id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Finished games with their scoreboards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GameResult"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The ticket's role has no bank",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such quiz of yours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/quizzes/{id}/kept": {
+      "put": {
+        "tags": [
+          "quizzes"
+        ],
+        "summary": "Keep a quiz (90 days after its last use) or let it go (7 days).",
+        "operationId": "keepQuiz",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Quiz id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeptBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The quiz as listed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuizSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The ticket's role has no bank",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such quiz of yours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateQuizBody": {
+        "type": "object",
+        "description": "Body of `POST /v1/quizzes`.",
+        "required": [
+          "title",
+          "questions"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "kept": {
+            "type": "boolean",
+            "description": "Keep the quiz (default) or let it go after 7 days.",
+            "default": true
+          },
+          "questions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionIn"
+            },
+            "description": "1 to 100 questions."
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "The body of every error response.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "One of UNAUTHORIZED, FORBIDDEN, NOT_FOUND, BAD_REQUEST, CONFLICT,\nINVALID, RATE_LIMITED (429), QUOTA_EXCEEDED (413), INTERNAL."
+          },
+          "fields": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/FieldError"
+            },
+            "description": "Present on INVALID: what is wrong and where."
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "FieldError": {
+        "type": "object",
+        "description": "One validation problem, on the field it belongs to.",
+        "required": [
+          "path",
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "Where, like `questions[2].options[1].text`."
+          }
+        }
+      },
+      "GameMode": {
+        "type": "string",
+        "description": "The kind of game that was played.",
+        "enum": [
+          "race",
+          "quest"
+        ]
+      },
+      "GameResult": {
+        "type": "object",
+        "description": "A finished game's results.",
+        "required": [
+          "id",
+          "startedAt",
+          "endedAt",
+          "expiresAt",
+          "mode",
+          "players",
+          "questions"
+        ],
+        "properties": {
+          "endedAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expiresAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the results are deleted (90 days after the game ended)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/GameMode"
+          },
+          "players": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlayerResult"
+            },
+            "description": "Best first."
+          },
+          "questions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionResult"
+            }
+          },
+          "startedAt": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "KeptBody": {
+        "type": "object",
+        "description": "Body of `PUT /v1/quizzes/{id}/kept`.",
+        "required": [
+          "kept"
+        ],
+        "properties": {
+          "kept": {
+            "type": "boolean"
+          }
+        }
+      },
+      "OptionIn": {
+        "type": "object",
+        "required": [
+          "text",
+          "isCorrect"
+        ],
+        "properties": {
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Give the id of an existing option to keep it, leave out for a new one."
+          },
+          "isCorrect": {
+            "type": "boolean"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "OptionOut": {
+        "type": "object",
+        "required": [
+          "id",
+          "text",
+          "isCorrect"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "isCorrect": {
+            "type": "boolean"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "PlayerResult": {
+        "type": "object",
+        "description": "A player's line on a finished game's scoreboard.",
+        "required": [
+          "rank",
+          "name",
+          "anonymous",
+          "score",
+          "totalMs",
+          "correctCount",
+          "answeredCount",
+          "bestStreak"
+        ],
+        "properties": {
+          "anonymous": {
+            "type": "boolean"
+          },
+          "answeredCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bestStreak": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The most answers in a row that were fully right."
+          },
+          "correctCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string",
+            "description": "Empty once the person has been forgotten."
+          },
+          "rank": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "score": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "totalMs": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "QuestionIn": {
+        "type": "object",
+        "required": [
+          "kind",
+          "text",
+          "options"
+        ],
+        "properties": {
+          "explanation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Give the id of an existing question to keep it (and the results\nrecorded for it), leave out for a new one."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/QuestionKind"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OptionIn"
+            },
+            "description": "2 to 6 options; exactly 2 for a true/false question."
+          },
+          "text": {
+            "type": "string"
+          },
+          "timeLimitSec": {
+            "type": "integer",
+            "format": "int64",
+            "description": "5 to 120 seconds.",
+            "default": 20
+          }
+        }
+      },
+      "QuestionKind": {
+        "type": "string",
+        "description": "The question kind stored in `questions.kind`.",
+        "enum": [
+          "single",
+          "multi",
+          "boolean"
+        ]
+      },
+      "QuestionOut": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "text",
+          "timeLimitSec",
+          "options"
+        ],
+        "properties": {
+          "explanation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/QuestionKind"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OptionOut"
+            },
+            "description": "In the order shown to players."
+          },
+          "text": {
+            "type": "string"
+          },
+          "timeLimitSec": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "QuestionResult": {
+        "type": "object",
+        "description": "How a question went in a finished game.",
+        "required": [
+          "questionId",
+          "position",
+          "text",
+          "answeredCount",
+          "correctCount"
+        ],
+        "properties": {
+          "answeredCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "correctCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "questionId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "Quiz": {
+        "type": "object",
+        "description": "A quiz with its questions and answer keys (its owner only).",
+        "required": [
+          "id",
+          "title",
+          "description",
+          "kept",
+          "expiresAt",
+          "createdAt",
+          "updatedAt",
+          "questionCount",
+          "questions"
+        ],
+        "properties": {
+          "createdAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kept": {
+            "type": "boolean"
+          },
+          "questionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "questions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionOut"
+            },
+            "description": "In the order they are asked."
+          },
+          "title": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "QuizList": {
+        "type": "object",
+        "description": "A page of the bank.",
+        "required": [
+          "items",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuizSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Quizzes in the whole bank."
+          }
+        }
+      },
+      "QuizSummary": {
+        "type": "object",
+        "description": "One quiz in a list.",
+        "required": [
+          "id",
+          "title",
+          "description",
+          "kept",
+          "expiresAt",
+          "createdAt",
+          "updatedAt",
+          "questionCount"
+        ],
+        "properties": {
+          "createdAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the sweep deletes the quiz unless it is used first."
+          },
+          "id": {
+            "type": "string"
+          },
+          "kept": {
+            "type": "boolean",
+            "description": "Kept quizzes live 90 days after their last use, the others 7."
+          },
+          "questionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "UpdateQuizBody": {
+        "type": "object",
+        "description": "Body of `PUT /v1/quizzes/{id}`: the whole quiz, saved at once.",
+        "required": [
+          "title",
+          "questions"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "questions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionIn"
+            },
+            "description": "1 to 100 questions; those left out are deleted."
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A ticket signed by the LMS server (role teacher or host), sent as `Authorization: Bearer <ticket>`."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "quizzes",
+      "description": "The teacher's quiz bank"
+    }
+  ]
+}

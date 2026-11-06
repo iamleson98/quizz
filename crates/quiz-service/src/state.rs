@@ -1,21 +1,37 @@
 //! Shared application state.
 
+use crate::clock::Clock;
 use crate::config::Config;
-use crate::model::LeaderboardEvent;
+use crate::game::store::DbStore;
+use crate::game::{Deps, Rooms};
+use jsonwebtoken::DecodingKey;
 use sqlx::SqlitePool;
-use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{Mutex, Notify};
 
 pub struct AppStateInner {
     pub cfg: Config,
     pub pool: SqlitePool,
     /// In-process COMMIT serializer for BEGIN CONCURRENT (see tx.rs).
     pub commit_mutex: Mutex<()>,
-    /// Fan-out for leaderboard subscription events.
-    pub leaderboard_tx: broadcast::Sender<LeaderboardEvent>,
+    /// Key tickets are verified with.
+    pub ticket_key: DecodingKey,
+    /// Rooms and running games.
+    pub rooms: Rooms,
+    /// What a room needs; set once the state exists.
+    deps: OnceLock<Deps>,
+    /// Woken when the spans outbox has something new to push.
+    pub spans_ready: Arc<Notify>,
+    pub clock: Clock,
+    /// Limits the bank's writes per person.
+    pub write_limiter: crate::ratelimit::Limiter,
     /// SQLite version reported by our custom build (for /healthz).
     pub sqlite_version: String,
     pub started_at: std::time::Instant,
+    /// Committed write transactions; the snapshot job compares it with the
+    /// value at its last snapshot to know whether anything changed.
+    pub commits: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -32,35 +48,49 @@ impl AppState {
     /// Connect, migrate, and build full application state.
     pub async fn connect(cfg: Config) -> crate::error::AppResult<Self> {
         let (pool, sqlite_version) = crate::db::connect_pool(&cfg).await?;
-        if cfg.seed_demo {
-            crate::db::seed_demo(&pool).await?;
-        }
-        let (leaderboard_tx, _) = broadcast::channel(256);
-        Ok(Self(Arc::new(AppStateInner {
+        let write_limiter =
+            crate::ratelimit::Limiter::new(cfg.bank_write_burst, cfg.bank_writes_per_minute);
+        let state = Self(Arc::new(AppStateInner {
+            ticket_key: DecodingKey::from_secret(cfg.ticket_key.expose().as_bytes()),
             cfg,
             pool,
             commit_mutex: Mutex::new(()),
-            leaderboard_tx,
+            rooms: Rooms::default(),
+            deps: OnceLock::new(),
+            spans_ready: Arc::new(Notify::new()),
+            clock: Clock::default(),
+            write_limiter,
             sqlite_version,
             started_at: std::time::Instant::now(),
-        })))
+            commits: AtomicU64::new(0),
+        }));
+        let clock_state = state.clone();
+        let _ = state.deps.set(Deps {
+            store: Arc::new(DbStore {
+                state: state.clone(),
+                spans_ready: state.spans_ready.clone(),
+            }),
+            now_ms: Arc::new(move || clock_state.now_ms()),
+            rooms: state.rooms.clone(),
+            track_spans: state.cfg.lms_url.is_some(),
+            quest_draw: Arc::new(|| Box::new(crate::game::quest::chest::SystemDraw)),
+        });
+        Ok(state)
     }
 
-    /// Wrap an existing pool (used by seeding and tests).
-    pub fn for_pool(pool: SqlitePool, cfg: Config) -> Self {
-        let (leaderboard_tx, _) = broadcast::channel(256);
-        Self(Arc::new(AppStateInner {
-            cfg,
-            pool,
-            commit_mutex: Mutex::new(()),
-            leaderboard_tx,
-            sqlite_version: String::new(),
-            started_at: std::time::Instant::now(),
-        }))
+    /// What rooms are built with.
+    pub fn deps(&self) -> &Deps {
+        self.deps
+            .get()
+            .expect("deps are set when the state is built")
     }
 
-    /// Publish a leaderboard refresh event (no-op when nobody subscribes).
-    pub fn publish_leaderboard(&self, event: LeaderboardEvent) {
-        let _ = self.leaderboard_tx.send(event);
+    /// Current unix time in milliseconds (the service clock).
+    pub fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
+    }
+
+    pub fn commits(&self) -> u64 {
+        self.commits.load(Ordering::Relaxed)
     }
 }

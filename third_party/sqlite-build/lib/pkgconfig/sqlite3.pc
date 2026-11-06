@@ -1,9 +1,0 @@
-prefix=${pcfiledir}/../..
-libdir=${prefix}/lib
-includedir=${prefix}/include
-
-Name: SQLite (begin-concurrent)
-Description: SQL database engine - custom build from github.com/sqlite/sqlite branch begin-concurrent @ 71f1e0e7384acdd2f80814a52df5f68cc4b99f33 (SQLite "3.55.0")
-Version: "3.55.0"
-Libs: -L${libdir} -lsqlite3 -lpthread -ldl -lm
-Cflags: -I${includedir}

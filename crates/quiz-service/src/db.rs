@@ -1,4 +1,4 @@
-//! Database pool construction, migrations and demo seeding.
+//! Database pool construction and migrations.
 //!
 //! Connection pragmas follow the begin-concurrent recommendations:
 //! WAL journaling, NORMAL sync, generous per-connection cache and mmap,
@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::AppResult;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Build connect options with the performance pragma set.
@@ -68,119 +69,21 @@ pub async fn ping(pool: &SqlitePool) -> AppResult<()> {
     Ok(())
 }
 
-/// Idempotent demo data: `demo` / `demo1234` user + a mixed demo quiz.
-/// Returns the demo quiz id when seeding created it (None if it existed).
-pub async fn seed_demo(pool: &SqlitePool) -> AppResult<()> {
-    use crate::AppState;
-    use crate::ids::{new_id, now_ms};
-    use crate::tx;
+/// Total size of the database files (the main file and its WAL) in bytes.
+pub fn size_bytes(path: &std::path::Path) -> u64 {
+    let len = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    len(path) + len(std::path::Path::new(&wal))
+}
 
-    // A tiny state purely for the tx engine primitives.
-    let cfg = Config {
-        listen_addr: String::new(),
-        database_path: std::path::PathBuf::from("seed"),
-        jwt_secret: String::new(),
-        jwt_ttl_hours: 1,
-        pool_max: 4,
-        pool_min: 1,
-        busy_timeout_ms: 5000,
-        tx_mode: crate::config::TxMode::Concurrent,
-        tx_max_retries: 64,
-        commit_mutex: true,
-        vfs: "unix".into(),
-        cache_size_kib: 8192,
-        mmap_size: 0,
-        otel_endpoint: None,
-        log_format: "pretty".into(),
-        seed_demo: false,
-    };
-    let state = AppState::for_pool(pool.clone(), cfg);
-
-    let hash = crate::auth::hash_password("demo1234")?;
-    tx::write_tx(&state, move |conn| {
-        let hash = hash.clone();
-        Box::pin(async move {
-            let demo_id: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM users WHERE username = 'demo'")
-                    .fetch_optional(&mut *conn)
-                    .await?;
-            let demo_id = match demo_id {
-                Some(id) => id,
-                None => {
-                    let id = new_id();
-                    sqlx::query("INSERT INTO users (id, username, password_hash, created_at) VALUES (?1, 'demo', ?2, ?3)")
-                        .bind(id)
-                        .bind(&hash)
-                        .bind(now_ms())
-                        .execute(&mut *conn)
-                        .await?;
-                    id
-                }
-            };
-
-            let existing: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM quizzes WHERE creator_id = ?1 AND title = 'General Knowledge Demo'")
-                    .bind(demo_id)
-                    .fetch_optional(&mut *conn)
-                    .await?;
-            if existing.is_some() {
-                return Ok(());
-            }
-
-            let quiz_id = new_id();
-            let now = now_ms();
-            sqlx::query(
-                "INSERT INTO quizzes (id, creator_id, title, description, is_public, time_limit_sec, max_attempts, created_at, updated_at)
-                 VALUES (?1, ?2, 'General Knowledge Demo', 'Three questions: single choice, multi select and true/false.', 1, NULL, NULL, ?3, ?3)",
-            )
-            .bind(quiz_id)
-            .bind(demo_id)
-            .bind(now)
-            .execute(&mut *conn)
-            .await?;
-
-            // (kind, text, points, options: &[(text, is_correct)])
-            type DemoQ<'a> = (&'a str, &'a str, f64, &'a [(&'a str, bool)]);
-            let questions: &[DemoQ] = &[
-                ("single", "Which planet is known as the Red Planet?", 1.0,
-                 &[("Venus", false), ("Mars", true), ("Jupiter", false)]),
-                ("multi", "Select all prime numbers.", 2.0,
-                 &[("2", true), ("9", false), ("13", true), ("15", false)]),
-                ("boolean", "The Pacific Ocean is the largest ocean on Earth.", 1.0,
-                 &[("True", true), ("False", false)]),
-            ];
-
-            for (pos, (kind, text, points, options)) in questions.iter().enumerate() {
-                let qid = new_id();
-                sqlx::query(
-                    "INSERT INTO questions (id, quiz_id, position, kind, text, points, explanation)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-                )
-                .bind(qid)
-                .bind(quiz_id)
-                .bind(pos as i64 + 1)
-                .bind(kind)
-                .bind(text)
-                .bind(points)
-                .execute(&mut *conn)
-                .await?;
-                for (opos, (otext, correct)) in options.iter().enumerate() {
-                    sqlx::query(
-                        "INSERT INTO options (id, question_id, position, text, is_correct)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                    )
-                    .bind(new_id())
-                    .bind(qid)
-                    .bind(opos as i64 + 1)
-                    .bind(otext)
-                    .bind(*correct)
-                    .execute(&mut *conn)
-                    .await?;
-                }
-            }
-            Ok(())
-        })
-    })
-    .await?;
-    Ok(())
+/// Export `quiz_db_size_bytes` now and every 30 s for the life of the process.
+pub fn spawn_size_gauge(path: PathBuf) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            metrics::gauge!("quiz_db_size_bytes").set(size_bytes(&path) as f64);
+        }
+    });
 }

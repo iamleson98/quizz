@@ -37,6 +37,11 @@ pub fn init_metrics() -> PrometheusHandle {
                     LATENCY_BUCKETS,
                 )
                 .expect("valid latency buckets")
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Prefix("quiz_question".into()),
+                    LATENCY_BUCKETS,
+                )
+                .expect("valid latency buckets")
                 .install_recorder()
                 .expect("install prometheus recorder")
         })
@@ -120,7 +125,7 @@ fn build_provider(cfg: &Config) -> Option<SdkTracerProvider> {
 /// axum middleware: per-route HTTP request counters and latency histograms.
 pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
     let start = Instant::now();
-    let method = req.method().to_string();
+    let method = method_label(req.method());
     let route = req
         .extensions()
         .get::<MatchedPath>()
@@ -141,4 +146,33 @@ pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
     metrics::histogram!("http_request_duration_seconds", "route" => route).record(elapsed);
 
     res
+}
+
+/// The method as a metric label: the known ones, and `OTHER` for anything a
+/// client can invent (the label set must stay small).
+fn method_label(m: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *m {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        Method::HEAD => "HEAD",
+        _ => "OTHER",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Method;
+
+    #[test]
+    fn unusual_methods_share_one_label() {
+        assert_eq!(method_label(&Method::GET), "GET");
+        assert_eq!(method_label(&Method::OPTIONS), "OPTIONS");
+        assert_eq!(method_label(&Method::PATCH), "OTHER");
+        assert_eq!(method_label(&Method::from_bytes(b"BREW").unwrap()), "OTHER");
+    }
 }

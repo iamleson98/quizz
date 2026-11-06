@@ -3,12 +3,15 @@
 #
 #   docker compose up --build
 #
-#   service     http://localhost:8080  (GraphQL, playground at /playground)
+#   service     http://localhost:8080  (the bank at /v1, the game socket at /ws)
+#               http://localhost:8081  (healthz, readyz, metrics: internal)
 #   jaeger ui   http://localhost:16686 (service: quiz-service)
 #   prometheus  http://localhost:9090
 #   grafana     http://localhost:3000  (anonymous login enabled)
 #
-# The service seeds a demo user (demo/demo1234) and demo quiz on startup.
+# Tickets are signed with QUIZ_TICKET_KEY; mint one for yourself with
+#   QUIZ_TICKET_KEY=... cargo run -p quiz-service --bin mint-ticket -- --role teacher --sub t1 --name Lan
+# Both keys are required (at least 32 bytes), there is no default.
 
 services:
   quiz-service:
@@ -16,14 +19,18 @@ services:
     image: quiz-service:latest
     environment:
       QUIZ_LISTEN_ADDR: 0.0.0.0:8080
+      QUIZ_INTERNAL_ADDR: 0.0.0.0:8081
       QUIZ_DATABASE: /data/quiz.db
-      QUIZ_JWT_SECRET: ${QUIZ_JWT_SECRET:-change-me-in-production}
-      QUIZ_SEED_DEMO: "1"
+      QUIZ_TICKET_KEY: ${QUIZ_TICKET_KEY:?set QUIZ_TICKET_KEY (at least 32 bytes)}
+      QUIZ_INTERNAL_KEY: ${QUIZ_INTERNAL_KEY:?set QUIZ_INTERNAL_KEY (at least 32 bytes)}
+      QUIZ_ALLOWED_ORIGINS: ${QUIZ_ALLOWED_ORIGINS:-http://localhost:5173}
+      QUIZ_LMS_URL: ${QUIZ_LMS_URL:-}
       QUIZ_TX_MODE: ${QUIZ_TX_MODE:-concurrent}
       QUIZ_OTEL_ENDPOINT: http://jaeger:4317
       RUST_LOG: info
     ports:
       - "8080:8080"
+      - "8081:8081"
     volumes:
       - quiz-data:/data
     depends_on:

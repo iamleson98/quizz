@@ -1,131 +1,96 @@
-//! Server-side grading engine.
+//! Server-side grading of one question.
 //!
-//! Runs entirely in Rust over the question/option rows loaded inside the
-//! submit transaction - the client never sends correctness data.
+//! The client never sends correctness data; the key lives in the service.
 //!
 //! Rules:
-//!  * `single` / `boolean`: correct only for the exact correct option.
-//!  * `multi`: partial credit
-//!    (selected_correct - selected_wrong) / total_correct, floored at 0,
-//!    full credit only when the exact set is chosen.
+//!  * `single` / `boolean`: full credit only for the exact correct option.
+//!  * `multi`: partial credit `(selected_correct - selected_wrong) /
+//!    total_correct`, floored at 0; `correct` only when the exact set is
+//!    chosen.
 
 use crate::model::{QuestionKind, QuestionWithOptions};
-use std::collections::HashMap;
+use std::collections::HashSet;
 
-/// Result of grading one question of an attempt.
-#[derive(Clone, Debug)]
-pub struct GradedAnswer {
-    pub question_id: i64,
+/// The outcome of grading one answer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Graded {
+    /// Distinct chosen option ids that belong to the question, sorted.
     pub selected: Vec<i64>,
-    pub correct_ids: Vec<i64>,
+    /// Exactly the right set was chosen.
     pub correct: bool,
-    pub awarded: f64,
-    pub possible: f64,
+    /// Share of the full score earned, 0.0 to 1.0.
+    pub credit: f64,
 }
 
-/// Result of grading a whole attempt.
-#[derive(Clone, Debug, Default)]
-pub struct GradedAttempt {
-    pub answers: Vec<GradedAnswer>,
-    pub score: f64,
-    pub max_score: f64,
+/// Ids of the correct options, in position order.
+pub fn correct_ids(question: &QuestionWithOptions) -> Vec<i64> {
+    question
+        .options
+        .iter()
+        .filter(|o| o.is_correct)
+        .map(|o| o.id)
+        .collect()
 }
 
-/// Grade `answers` (question_id -> selected option ids) against the quiz
-/// questions. Questions with no submitted answer count as zero.
-pub fn grade(questions: &[QuestionWithOptions], answers: &HashMap<i64, Vec<i64>>) -> GradedAttempt {
-    let mut graded = Vec::with_capacity(questions.len());
-    let mut score = 0.0f64;
-    let mut max_score = 0.0f64;
+/// Grade the chosen option ids against a question. Ids that do not belong
+/// to it are ignored.
+pub fn grade_question(question: &QuestionWithOptions, chosen: &[i64]) -> Graded {
+    let valid: HashSet<i64> = question.options.iter().map(|o| o.id).collect();
+    let mut selected: Vec<i64> = chosen
+        .iter()
+        .copied()
+        .filter(|id| valid.contains(id))
+        .collect();
+    selected.sort_unstable();
+    selected.dedup();
 
-    for qw in questions {
-        let q = &qw.question;
-        max_score += q.points;
-
-        // Deduplicate and keep only options that belong to this question.
-        let valid_ids: std::collections::HashSet<i64> = qw.options.iter().map(|o| o.id).collect();
-        let selected: Vec<i64> = {
-            let mut v: Vec<i64> = answers
-                .get(&q.id)
-                .map(|ids| {
-                    ids.iter()
-                        .copied()
-                        .filter(|id| valid_ids.contains(id))
-                        .collect()
-                })
-                .unwrap_or_default();
-            v.sort_unstable();
-            v.dedup();
-            v
-        };
-
-        let correct_ids: Vec<i64> = qw
-            .options
-            .iter()
-            .filter(|o| o.is_correct)
-            .map(|o| o.id)
-            .collect();
-
-        let (correct, awarded) = match q.kind {
-            QuestionKind::Single | QuestionKind::Boolean => {
-                let ok =
-                    correct_ids.len() == 1 && selected.len() == 1 && selected[0] == correct_ids[0];
-                (ok, if ok { q.points } else { 0.0 })
+    let correct = correct_ids(question);
+    match question.question.kind {
+        QuestionKind::Single | QuestionKind::Boolean => {
+            let ok = correct.len() == 1 && selected.len() == 1 && selected[0] == correct[0];
+            Graded {
+                selected,
+                correct: ok,
+                credit: if ok { 1.0 } else { 0.0 },
             }
-            QuestionKind::Multi => {
-                let total_correct = correct_ids.len().max(1) as f64;
-                let correct_set: std::collections::HashSet<i64> =
-                    correct_ids.iter().copied().collect();
-                let sel_correct = selected
-                    .iter()
-                    .filter(|id| correct_set.contains(*id))
-                    .count() as f64;
-                let sel_wrong = selected.len() as f64 - sel_correct;
-                let ratio = ((sel_correct - sel_wrong) / total_correct).max(0.0);
-                let awarded = (q.points * ratio).min(q.points);
-                (ratio >= 1.0, awarded)
+        }
+        QuestionKind::Multi => {
+            let total = correct.len().max(1) as f64;
+            let correct_set: HashSet<i64> = correct.iter().copied().collect();
+            let right = selected
+                .iter()
+                .filter(|id| correct_set.contains(*id))
+                .count() as f64;
+            let wrong = selected.len() as f64 - right;
+            let credit = ((right - wrong) / total).clamp(0.0, 1.0);
+            Graded {
+                selected,
+                correct: credit >= 1.0,
+                credit,
             }
-        };
-
-        score += awarded;
-        graded.push(GradedAnswer {
-            question_id: q.id,
-            selected,
-            correct_ids,
-            correct,
-            awarded,
-            possible: q.points,
-        });
+        }
     }
-
-    // Clamp tiny float artifacts.
-    score = round2(score);
-    max_score = round2(max_score);
-    GradedAttempt {
-        answers: graded,
-        score,
-        max_score,
-    }
-}
-
-fn round2(v: f64) -> f64 {
-    (v * 100.0).round() / 100.0
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{OptionRow, QuestionRow};
 
-    fn q(id: i64, kind: QuestionKind, points: f64, options: &[(i64, bool)]) -> QuestionWithOptions {
+    pub fn question(
+        id: i64,
+        kind: QuestionKind,
+        time_limit_sec: i64,
+        options: &[(i64, bool)],
+    ) -> QuestionWithOptions {
         QuestionWithOptions {
             question: QuestionRow {
                 id,
                 quiz_id: 1,
-                position: 1,
+                position: id,
                 kind,
                 text: format!("q{id}"),
-                points,
+                time_limit_sec,
                 explanation: None,
             },
             options: options
@@ -142,72 +107,60 @@ mod tests {
         }
     }
 
-    fn ans(map: &[(i64, Vec<i64>)]) -> HashMap<i64, Vec<i64>> {
-        map.iter().cloned().collect()
-    }
-
     #[test]
     fn single_exact_match_only() {
-        let qs = vec![q(
+        let q = question(
             1,
             QuestionKind::Single,
-            2.0,
+            20,
             &[(10, true), (11, false), (12, false)],
-        )];
-        let g = grade(&qs, &ans(&[(1, vec![10])]));
-        assert!(g.answers[0].correct);
-        assert_eq!(g.score, 2.0);
-
-        let g = grade(&qs, &ans(&[(1, vec![11])]));
-        assert!(!g.answers[0].correct);
-        assert_eq!(g.score, 0.0);
-
-        let g = grade(&qs, &ans(&[]));
-        assert_eq!(g.score, 0.0);
+        );
+        assert!(grade_question(&q, &[10]).correct);
+        assert_eq!(grade_question(&q, &[10]).credit, 1.0);
+        assert!(!grade_question(&q, &[11]).correct);
+        assert_eq!(grade_question(&q, &[10, 11]).credit, 0.0);
+        assert_eq!(grade_question(&q, &[]).credit, 0.0);
     }
 
     #[test]
     fn boolean_grades_like_single() {
-        let qs = vec![q(1, QuestionKind::Boolean, 1.0, &[(10, false), (11, true)])];
-        let g = grade(&qs, &ans(&[(1, vec![11])]));
-        assert_eq!(g.score, 1.0);
+        let q = question(1, QuestionKind::Boolean, 20, &[(10, false), (11, true)]);
+        assert_eq!(grade_question(&q, &[11]).credit, 1.0);
+        assert_eq!(grade_question(&q, &[10]).credit, 0.0);
     }
 
     #[test]
     fn multi_partial_credit() {
-        // 2 correct of 4, 2 points
-        let qs = vec![q(
+        let q = question(
             1,
             QuestionKind::Multi,
-            2.0,
+            20,
             &[(10, true), (11, false), (12, true), (13, false)],
-        )];
+        );
+        let all = grade_question(&q, &[10, 12]);
+        assert!(all.correct);
+        assert_eq!(all.credit, 1.0);
 
-        // all correct
-        let g = grade(&qs, &ans(&[(1, vec![10, 12])]));
-        assert!(g.answers[0].correct);
-        assert_eq!(g.score, 2.0);
+        // one right, one wrong: (1 - 1) / 2 = 0
+        assert_eq!(grade_question(&q, &[10, 11]).credit, 0.0);
 
-        // one correct, one wrong: (1 - 1)/2 = 0
-        let g = grade(&qs, &ans(&[(1, vec![10, 11])]));
-        assert!(!g.answers[0].correct);
-        assert_eq!(g.score, 0.0);
+        // only one of two right: 0.5
+        let half = grade_question(&q, &[10]);
+        assert!(!half.correct);
+        assert!((half.credit - 0.5).abs() < 1e-9);
 
-        // only one correct selected: (1 - 0)/2 = 0.5
-        let g = grade(&qs, &ans(&[(1, vec![10])]));
-        assert!(!g.answers[0].correct);
-        assert!((g.score - 1.0).abs() < 1e-9);
+        // everything right plus one wrong: (2 - 1) / 2
+        assert!((grade_question(&q, &[10, 12, 13]).credit - 0.5).abs() < 1e-9);
 
-        // more wrong than correct clamps at zero
-        let g = grade(&qs, &ans(&[(1, vec![11, 13])]));
-        assert_eq!(g.score, 0.0);
+        // more wrong than right clamps at zero
+        assert_eq!(grade_question(&q, &[11, 13]).credit, 0.0);
     }
 
     #[test]
-    fn foreign_option_ids_are_ignored() {
-        let qs = vec![q(1, QuestionKind::Single, 1.0, &[(10, true), (11, false)])];
-        let g = grade(&qs, &ans(&[(1, vec![10, 999])]));
-        assert!(g.answers[0].correct, "unknown option ids must be ignored");
-        assert_eq!(g.score, 1.0);
+    fn foreign_and_duplicate_ids_are_ignored() {
+        let q = question(1, QuestionKind::Single, 20, &[(10, true), (11, false)]);
+        let g = grade_question(&q, &[10, 10, 999]);
+        assert!(g.correct);
+        assert_eq!(g.selected, vec![10]);
     }
 }

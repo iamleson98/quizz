@@ -37,13 +37,17 @@ COPY --from=builder /out/quiz-service /usr/local/bin/quiz-service
 COPY --from=builder /out/quiz-bench  /usr/local/bin/quiz-bench
 
 USER quiz
+# QUIZ_TICKET_KEY, QUIZ_INTERNAL_KEY and QUIZ_ALLOWED_ORIGINS are required
+# and have no default: the service refuses to start without them.
 ENV QUIZ_LISTEN_ADDR=0.0.0.0:8080 \
+    QUIZ_INTERNAL_ADDR=0.0.0.0:8081 \
     QUIZ_DATABASE=/data/quiz.db \
+    QUIZ_SNAPSHOT_DIR=/data/snapshots \
     RUST_LOG=info
 VOLUME /data
-EXPOSE 8080
+EXPOSE 8080 8081
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -sf http://127.0.0.1:8080/healthz || exit 1
+    CMD curl -sf http://127.0.0.1:8081/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/quiz-service"]

@@ -5,10 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-argon2 = "0.6.0"
-async-graphql = { version = "7.2.1", features = ["tracing"] }
-async-graphql-axum = "7.2.1"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 futures = "0.3.34"
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 metrics = "0.24.6"
@@ -25,18 +22,27 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
     "macros",
 ] }
+subtle = "2.6.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 thiserror.workspace = true
 tokio = { workspace = true }
-tokio-stream = { version = "0.1.19", features = ["sync"] }
 tower-http = { version = "0.7.1", features = [
+    "compression-br",
     "compression-gzip",
-    "timeout",
+    "compression-zstd",
+    "cors",
     "limit",
+    "set-header",
+    "timeout",
 ] }
 tracing.workspace = true
 tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
+utoipa = "6.0.0"
+
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 http-body-util = "0.1.5"
 tower = { version = "0.5.3", features = ["util"] }
+tokio-tungstenite = "0.28"

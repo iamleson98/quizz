@@ -6,5 +6,4 @@ third_party/sqlite
 .git
 .idea
 .vscode
-loadtest
 observability
