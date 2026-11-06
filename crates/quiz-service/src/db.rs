@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::AppResult;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Build connect options with the performance pragma set.
@@ -66,4 +67,23 @@ pub async fn connect_pool(cfg: &Config) -> AppResult<(SqlitePool, String)> {
 pub async fn ping(pool: &SqlitePool) -> AppResult<()> {
     sqlx::query("SELECT 1").execute(pool).await?;
     Ok(())
+}
+
+/// Total size of the database files (the main file and its WAL) in bytes.
+pub fn size_bytes(path: &std::path::Path) -> u64 {
+    let len = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    len(path) + len(std::path::Path::new(&wal))
+}
+
+/// Export `quiz_db_size_bytes` now and every 30 s for the life of the process.
+pub fn spawn_size_gauge(path: PathBuf) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            metrics::gauge!("quiz_db_size_bytes").set(size_bytes(&path) as f64);
+        }
+    });
 }

@@ -667,10 +667,21 @@ async fn a_write_transaction_that_is_dropped_midway_leaves_the_connection_clean(
     assert_eq!(after, 14, "every later write landed");
     let in_tx: bool = {
         let mut conn = state.pool.acquire().await.unwrap();
-        sqlx::Connection::begin(&mut *conn)
-            .await
-            .map(drop)
-            .is_ok()
+        sqlx::Connection::begin(&mut *conn).await.map(drop).is_ok()
     };
     assert!(in_tx, "the connection is not left inside a transaction");
+}
+
+#[tokio::test]
+async fn the_database_size_is_measured_with_its_wal() {
+    let state = setup().await;
+    let router = public_router(state.clone());
+    let t = ticket(&state, Role::Teacher, "teacher1");
+    post(&router, "/v1/quizzes", &t, quiz_body("size")).await;
+    let size = quiz_service::db::size_bytes(&state.cfg.database_path);
+    assert!(size > 4096, "{size}");
+    assert_eq!(
+        quiz_service::db::size_bytes(std::path::Path::new("/no/such/file")),
+        0
+    );
 }

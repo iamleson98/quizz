@@ -68,7 +68,7 @@ impl std::fmt::Debug for Secret {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Public listener: `/graphql` and `/graphql/ws` only.
+    /// Public listener: the bank under `/v1/*` and the game socket `/ws` only.
     pub listen_addr: String,
     /// Internal listener: health, readiness, metrics and `/internal/*`.
     pub internal_addr: String,
@@ -90,8 +90,8 @@ pub struct Config {
     pub lms_url: Option<String>,
     /// Tokio worker threads: the node's SFU must keep its cores.
     pub worker_threads: usize,
-    /// Maximum pool connections (SQLite handles concurrent BEGIN CONCURRENT
-    /// writers, so this can exceed the classic single-writer sizing).
+    /// Maximum pool connections. Each holds its own page cache, so the worst
+    /// case memory is `pool_max x cache_size_kib` plus the mapped file.
     pub pool_max: u32,
     /// Minimum pool connections kept warm.
     pub pool_min: u32,
@@ -108,9 +108,13 @@ pub struct Config {
     /// use, as recommended by the branch docs); set to `unix` to allow
     /// external processes (e.g. the sqlite3 CLI) to access the live file.
     pub vfs: String,
-    /// Per-connection page cache in KiB (negative pragma cache_size).
+    /// Per-connection page cache in KiB (negative pragma cache_size). A write
+    /// transaction must fit in it (concurrent transactions cannot spill): the
+    /// biggest one, a class's answers at the close of a question, touches well
+    /// under 1 MiB.
     pub cache_size_kib: i64,
-    /// Memory-mapped I/O read limit in bytes.
+    /// Memory-mapped I/O read limit in bytes (file-backed and shared by all
+    /// connections: resident only as far as the database is that big).
     pub mmap_size: i64,
     /// OpenTelemetry OTLP gRPC endpoint (enables OTel tracing when set).
     pub otel_endpoint: Option<String>,
@@ -191,6 +195,13 @@ impl Config {
                 "QUIZ_LMS_URL must be a plain http:// URL (it is an in-cluster call)".into(),
             );
         }
+        let pool_max = num("QUIZ_POOL_MAX", "4")? as u32;
+        let pool_min = num("QUIZ_POOL_MIN", "2")? as u32;
+        if pool_max == 0 || pool_min > pool_max {
+            return Err(
+                "QUIZ_POOL_MIN must not exceed QUIZ_POOL_MAX, which must be at least 1".into(),
+            );
+        }
         let worker_threads = num("QUIZ_WORKER_THREADS", "2")? as usize;
         if worker_threads == 0 {
             return Err("QUIZ_WORKER_THREADS must be at least 1".into());
@@ -217,15 +228,15 @@ impl Config {
             allowed_origins,
             lms_url,
             worker_threads,
-            pool_max: num("QUIZ_POOL_MAX", "8")? as u32,
-            pool_min: num("QUIZ_POOL_MIN", "2")? as u32,
+            pool_max,
+            pool_min,
             busy_timeout_ms: num("QUIZ_BUSY_TIMEOUT_MS", "5000")?,
             tx_mode,
             tx_max_retries: num("QUIZ_TX_MAX_RETRIES", "64")? as u32,
             commit_mutex: or("QUIZ_COMMIT_MUTEX", "1") != "0",
             vfs: or("QUIZ_SQLITE_VFS", "unix-excl"),
-            cache_size_kib: num("QUIZ_CACHE_SIZE_KIB", "32768")? as i64,
-            mmap_size: num("QUIZ_MMAP_SIZE", "268435456")? as i64,
+            cache_size_kib: num("QUIZ_CACHE_SIZE_KIB", "4096")? as i64,
+            mmap_size: num("QUIZ_MMAP_SIZE", "67108864")? as i64,
             otel_endpoint,
             log_format: or("QUIZ_LOG_FORMAT", "json"),
         })
@@ -349,6 +360,29 @@ mod tests {
             None
         );
         assert!(Config::from_lookup(lookup(&[("QUIZ_LMS_URL", "https://x")])).is_err());
+    }
+
+    #[test]
+    fn memory_defaults_fit_a_256_mib_pod_with_room_to_spare() {
+        let cfg = Config::from_lookup(lookup(&[])).unwrap();
+        // every connection's page cache, plus the largest mapping
+        let worst_case_mib =
+            (i64::from(cfg.pool_max) * cfg.cache_size_kib) / 1024 + cfg.mmap_size / (1024 * 1024);
+        assert_eq!(
+            (cfg.pool_max, cfg.cache_size_kib, cfg.mmap_size),
+            (4, 4096, 64 * 1024 * 1024)
+        );
+        assert!(worst_case_mib <= 80, "{worst_case_mib} MiB");
+        // overridable, but a pool must make sense
+        let big = Config::from_lookup(lookup(&[
+            ("QUIZ_POOL_MAX", "8"),
+            ("QUIZ_CACHE_SIZE_KIB", "32768"),
+        ]))
+        .unwrap();
+        assert_eq!((big.pool_max, big.cache_size_kib), (8, 32768));
+        assert!(
+            Config::from_lookup(lookup(&[("QUIZ_POOL_MAX", "1"), ("QUIZ_POOL_MIN", "2")])).is_err()
+        );
     }
 
     #[test]

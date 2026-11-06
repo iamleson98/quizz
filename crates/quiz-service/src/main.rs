@@ -58,6 +58,7 @@ async fn run(cfg: Config) -> Result<(), String> {
     let public = bind(&cfg.listen_addr).await?;
     let internal = bind(&cfg.internal_addr).await?;
 
+    quiz_service::db::spawn_size_gauge(cfg.database_path.clone());
     retention::spawn(state.clone());
     snapshot::spawn(state.clone());
     // one pusher: it runs for the life of the process and flushes at the end

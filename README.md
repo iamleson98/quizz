@@ -217,14 +217,14 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
 | `QUIZ_SNAPSHOT_INTERVAL_SECS` | `900` | time between snapshot attempts |
 | `QUIZ_LMS_URL` | `http://lms-server.lms.svc.cluster.local:8065` | the LMS server (plain http) that receives lesson-time spans; empty turns pushing off |
 | `QUIZ_WORKER_THREADS` | `2` | tokio worker threads: on its node the service shares cores with the SFU |
-| `QUIZ_POOL_MAX` / `QUIZ_POOL_MIN` | `8` / `2` | sqlx pool size |
+| `QUIZ_POOL_MAX` / `QUIZ_POOL_MIN` | `4` / `2` | sqlx pool size (each connection has its own page cache) |
 | `QUIZ_BUSY_TIMEOUT_MS` | `5000` | per-connection busy timeout |
 | `QUIZ_TX_MODE` | `concurrent` | `concurrent` \| `deferred` \| `immediate` |
 | `QUIZ_TX_MAX_RETRIES` | `64` | write-transaction retry budget on busy/snapshot conflicts |
 | `QUIZ_COMMIT_MUTEX` | `1` | serialize COMMITs in-process (recommended) |
 | `QUIZ_SQLITE_VFS` | `unix-excl` | `unix` if external tools need the live file |
-| `QUIZ_CACHE_SIZE_KIB` | `32768` | per-connection page cache |
-| `QUIZ_MMAP_SIZE` | `268435456` | mmap read limit |
+| `QUIZ_CACHE_SIZE_KIB` | `4096` | per-connection page cache |
+| `QUIZ_MMAP_SIZE` | `67108864` | mmap read limit (file-backed, shared by the connections) |
 | `QUIZ_OTEL_ENDPOINT` | unset | OTLP gRPC endpoint (e.g. `http://jaeger:4317`) |
 | `QUIZ_LOG_FORMAT` | `json` | `json` \| `pretty` |
 | `RUST_LOG` | `info` | tracing filter |
@@ -270,10 +270,17 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
   `quiz_players_connected`, `quiz_answers_total`,
   `quiz_question_close_seconds` (histogram), `tx_commits_total`,
   `tx_retries_total` (write conflicts), `tx_duration_seconds`,
-  `quiz_snapshot_last_success_seconds`, `quiz_spans_outbox_depth`,
+  `quiz_snapshot_last_success_seconds`, `quiz_db_size_bytes`, `quiz_spans_outbox_depth`,
   `quiz_spans_pushed_total`, `quiz_spans_dropped_total`, and
   `http_requests_total` / `http_request_duration_seconds` per route.
   `observability/` has a Prometheus config and a Grafana dashboard.
+- **Memory.** The SQLite defaults are sized for a 256 MiB pod: 4 connections x 4 MiB
+  of page cache = 16 MiB, a 64 MiB mapping of the database file (shared, resident
+  only as far as the file is big), about 10 MiB of process, about 12 KiB a socket
+  (12 MiB for a thousand): roughly 100 MiB in the worst case. A write transaction
+  must fit in the page cache; the biggest (a class's answers at the close of a
+  question) touches well under 1 MiB. `quiz_db_size_bytes` exports the size of the
+  database and its WAL.
 - **Keep write transactions small**: concurrent transactions cannot spill their
   page cache mid-transaction (enforced by the patch itself).
 - **`unix-excl`** locks the database file exclusively for the process, so the
@@ -292,7 +299,7 @@ fails with `SQLITE_BUSY_SNAPSHOT` and is retried.
 | Every write runs in `BEGIN CONCURRENT` with retry (exponential backoff and jitter, metrics per retry) | `src/tx.rs` |
 | Random 62-bit row ids: increasing ids funnel concurrent inserts onto one page | `src/ids.rs` |
 | An in-process COMMIT mutex, as the branch docs recommend for one process | `src/tx.rs` |
-| `unix-excl` VFS, WAL, `synchronous=NORMAL`, 32 MiB page cache, in-memory temp store | `src/db.rs` |
+| `unix-excl` VFS, WAL, `synchronous=NORMAL`, a 4 MiB page cache per connection, in-memory temp store | `src/db.rs` |
 | sqlx linked against our static SQLite through `SQLITE3_LIB_DIR` and a pkg-config shim | `.cargo/config.toml`, `scripts/build-sqlite.sh` |
 
 ## Layout
