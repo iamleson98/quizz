@@ -19,6 +19,7 @@ const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 100;
 
 #[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListParams {
     /// Page size, 1 to 100 (default 50).
     #[param(minimum = 1, maximum = 100, default = 50)]

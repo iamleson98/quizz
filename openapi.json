@@ -20,14 +20,11 @@
         "parameters": [
           {
             "name": "limit",
-            "in": "path",
+            "in": "query",
             "description": "Page size, 1 to 100 (default 50).",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "format": "int64",
               "default": 50,
               "maximum": 100,
@@ -36,14 +33,11 @@
           },
           {
             "name": "offset",
-            "in": "path",
+            "in": "query",
             "description": "Quizzes to skip (default 0).",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "format": "int64",
               "default": 0,
               "minimum": 0
