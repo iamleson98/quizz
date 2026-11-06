@@ -24,7 +24,7 @@ Sec-WebSocket-Protocol: quiz.v1
 - The subprotocol `quiz.v1` must be offered (400 otherwise) and is the one
   selected.
 - The ticket never goes in the URL. The **first client frame must be
-  `hello`, within 5 s**; otherwise the socket gets `[8,1,0]` and is closed.
+  `hello`, within 2 s**; otherwise the socket gets `[8,1,0]` and is closed.
 - Tickets are signed by the LMS server: `role` `host` (the session's teacher) or
   `player` (a student of the session), with `sid`, `cid` and `rc`. A `teacher`
   ticket has no game: it is answered `[8,2,0]` and the socket is closed. The
@@ -181,7 +181,7 @@ where the room is:
 So a client that reconnects (back after a lost network, a reload) simply sends
 `hello` again and renders whatever arrives first. A player keeps their score,
 rank and answer: they are the game's, keyed by the ticket's `sub`. A player who
-opens a second tab is the same player (up to four sockets per person). Players
+opens a second tab is the same player (up to four sockets per person; see below). Players
 who join in the middle of a game score from the next question; they see the open
 one and an answer to it is refused with error 5.
 
@@ -200,8 +200,12 @@ server, so a wrong client clock cannot buy points.
 
 ## Limits and rate limits
 
-- Up to **4 sockets per person**, 500 players per game, one running game per
-  session and per teacher.
+- Up to **4 sockets per person**: a fifth is accepted and the **oldest** is closed
+  (1008, "replaced by a newer socket"), so a phone that lost its network never locks
+  the person out. 500 players per game, one running game per session and per
+  teacher. The service also limits sockets that have not said hello yet, per client
+  address (64, enough for a school behind one address) and in all, so say hello
+  at once.
 - A client frame is at most 128 bytes after hello (2 KiB for hello). A longer
   one closes the socket with code 1009.
 - A burst of 10 frames, then 2 per second: faster than that is answered
@@ -209,7 +213,9 @@ server, so a wrong client clock cannot buy points.
 - A socket that cannot take the frames sent to it (its small queue stays full)
   is closed with 1013; reconnect and resume.
 - The server pings every 25 s (a websocket ping, not a frame); browsers answer by
-  themselves. There is no application heartbeat: do not send one.
+  themselves, and a peer that has not answered 10 s after a ping is closed (1008).
+  A frame the peer does not take within 10 s drops the socket too. There is no
+  application heartbeat: do not send one.
 - A game ends by itself when the ticket's `rc` passes (reason `1`) or after an
   hour without a host command or an answer (reason `2`). A deploy of the
   service ends running games (reason `3`) and closes sockets with 1001.

@@ -58,7 +58,9 @@ pub struct Member {
 pub enum Cmd {
     Attach(Member, oneshot::Sender<AppResult<()>>),
     Detach(u64),
-    Frame(u64, ClientFrame),
+    /// A client frame and the instant it was received by the socket (not when
+    /// the room got to it): answers are timed from it.
+    Frame(u64, ClientFrame, Instant),
     Forget(String, oneshot::Sender<()>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -88,8 +90,8 @@ impl RoomHandle {
         let _ = self.tx.send(Cmd::Detach(sock)).await;
     }
 
-    pub async fn frame(&self, sock: u64, frame: ClientFrame) {
-        let _ = self.tx.send(Cmd::Frame(sock, frame)).await;
+    pub async fn frame(&self, sock: u64, frame: ClientFrame, received: Instant) {
+        let _ = self.tx.send(Cmd::Frame(sock, frame, received)).await;
     }
 
     pub async fn forget(&self, user: String) {
@@ -398,7 +400,7 @@ impl Room {
                 let _ = reply.send(res);
             }
             Cmd::Detach(sock) => self.detach(sock).await,
-            Cmd::Frame(sock, frame) => self.frame(sock, frame).await,
+            Cmd::Frame(sock, frame, at) => self.frame(sock, frame, at).await,
             Cmd::Forget(user, reply) => {
                 self.forget(&user).await;
                 let _ = reply.send(());
@@ -575,7 +577,7 @@ impl Room {
 
     // ------------------------------------------------------------- frames
 
-    async fn frame(&mut self, sock: u64, frame: ClientFrame) {
+    async fn frame(&mut self, sock: u64, frame: ClientFrame, at: Instant) {
         let Some(s) = self.socks.get(&sock) else {
             return;
         };
@@ -605,14 +607,14 @@ impl Room {
             }
             // while a quest game exists, the host's next/end and the
             // players' frames are the quest's
-            frame if self.quest.is_some() => self.quest_frame(sock, role, &user, frame).await,
+            frame if self.quest.is_some() => self.quest_frame(sock, role, &user, frame, at).await,
             ClientFrame::Character(_)
             | ClientFrame::QuestAnswer { .. }
             | ClientFrame::QuestPick { .. }
             | ClientFrame::QuestNext => Err(AppError::Conflict("there is no quest game".into())),
             ClientFrame::Next => self.next(role, &user).await,
             ClientFrame::End => self.end(role, &user).await,
-            ClientFrame::Answer { q, mask } => self.answer(sock, role, q, mask).await,
+            ClientFrame::Answer { q, mask } => self.answer(sock, role, q, mask, at).await,
         };
         if let Err(e) = res {
             tracing::debug!(error = %e, request = kind, "game frame refused");
@@ -997,7 +999,14 @@ impl Room {
         self.progress_dirty = false;
     }
 
-    async fn answer(&mut self, sock: u64, role: Role, q: u32, mask: u32) -> AppResult<()> {
+    async fn answer(
+        &mut self,
+        sock: u64,
+        role: Role,
+        q: u32,
+        mask: u32,
+        at: Instant,
+    ) -> AppResult<()> {
         if role != Role::Player {
             return Err(AppError::Forbidden);
         }
@@ -1006,7 +1015,9 @@ impl Room {
             .get(&sock)
             .and_then(|s| s.pid)
             .ok_or(AppError::Forbidden)?;
-        let now = Instant::now();
+        // timed from when the socket received the frame, not from when the
+        // room got to it
+        let now = at;
         let g = self
             .game
             .as_mut()

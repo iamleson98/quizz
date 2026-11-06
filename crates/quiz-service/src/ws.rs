@@ -1,6 +1,6 @@
 //! The game socket: `GET /ws`, subprotocol `quiz.v1` (see `PROTOCOL.md`).
 //!
-//! One task per socket. After the upgrade it waits 5 s for `hello`, checks
+//! One task per socket. After the upgrade it waits 2 s for `hello`, checks
 //! the ticket once, attaches to the room of the ticket's session and then
 //! only relays: frames from the client go to the room, shared bytes from the
 //! room go to the client. The only periodic traffic is a websocket ping.
@@ -8,23 +8,28 @@
 use crate::auth::{Role, Ticket};
 use crate::error::AppError;
 use crate::game::frames::{self, ClientFrame, Out, parse_client};
-use crate::game::registry::{UnknownGuard, out_channel};
+use crate::game::registry::{Turned, UnknownGuard, out_channel};
 use crate::game::room::Member;
 use crate::state::AppState;
-use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::time::Instant;
 
 /// The subprotocol the socket speaks.
 pub const SUBPROTOCOL: &str = "quiz.v1";
 /// How long a new socket has to say hello.
-pub const HELLO_WITHIN: Duration = Duration::from_secs(5);
-/// Websocket ping interval (keeps proxies' idle limits away).
-pub const PING_EVERY: Duration = Duration::from_secs(25);
+pub const HELLO_WITHIN: Duration = Duration::from_secs(2);
+/// A frame we send must be taken by the peer within this long, or the socket
+/// is dropped (a peer that stopped reading must not pin a task and a queue).
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Largest frame accepted before hello (a ticket is ~600 bytes).
 const MAX_HELLO_BYTES: usize = 2048;
 /// Largest frame accepted after hello.
@@ -36,12 +41,58 @@ const REFILL_PER_SEC: f32 = 2.0;
 /// Per-socket buffer sizes: a few KB, not the library's 128 KiB defaults.
 const READ_BUFFER: usize = 1024;
 const WRITE_BUFFER: usize = 0;
-/// A ceiling, not an allocation: the host's one full list of 500 names can
-/// be 30 KB.
-const MAX_WRITE_BUFFER: usize = 64 * 1024;
+/// A ceiling, not an allocation (the buffer is flushed after every frame): the
+/// biggest frames are the host's, a roster or the full order at the podium of
+/// 500 players with names of up to [`crate::auth::MAX_NAME_BYTES`] bytes and
+/// their JSON escapes, about 180 KB at the very worst.
+const MAX_WRITE_BUFFER: usize = 512 * 1024;
+
+/// The address of the client behind the request.
+///
+/// The edge (Traefik, behind Cloudflare that only it admits) passes
+/// `CF-Connecting-IP`, the address Cloudflare saw, and `X-Real-Ip`; they are
+/// read in that order, then the address of the peer. Nothing but the edge can
+/// reach the public listener, so the headers are not forgeable by a client; run
+/// the service somewhere else and they would be.
+pub struct ClientIp(pub IpAddr);
+
+impl FromRequestParts<AppState> for ClientIp {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &AppState) -> Result<Self, Infallible> {
+        let header = |name: &str| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        };
+        let ip = header("cf-connecting-ip")
+            .or_else(|| header("x-real-ip"))
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|c| c.0.ip())
+            })
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        Ok(ClientIp(ip))
+    }
+}
+
+/// The buffer sizes and limits every game socket gets.
+pub fn tune(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    ws.protocols([SUBPROTOCOL])
+        .read_buffer_size(READ_BUFFER)
+        .write_buffer_size(WRITE_BUFFER)
+        .max_write_buffer_size(MAX_WRITE_BUFFER)
+        .max_message_size(MAX_HELLO_BYTES)
+        .max_frame_size(MAX_HELLO_BYTES)
+}
 
 pub async fn handler(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -62,29 +113,44 @@ pub async fn handler(
         return AppError::BadRequest(format!("the {SUBPROTOCOL} subprotocol is required"))
             .into_response();
     }
-    let Some(guard) = state.rooms.admit_unknown() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let guard = match state.rooms.admit_unknown(ip) {
+        Ok(guard) => guard,
+        Err(Turned::TooManyFromThisAddress) => {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        Err(Turned::TooManyInAll) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    ws.protocols([SUBPROTOCOL])
-        .read_buffer_size(READ_BUFFER)
-        .write_buffer_size(WRITE_BUFFER)
-        .max_write_buffer_size(MAX_WRITE_BUFFER)
-        .max_message_size(MAX_HELLO_BYTES)
-        .max_frame_size(MAX_HELLO_BYTES)
-        .on_upgrade(move |socket| serve(state, socket, guard))
+    tune(ws).on_upgrade(move |socket| serve(state, socket, guard))
+}
+
+/// Send, giving up when the peer does not take it within [`SEND_TIMEOUT`].
+async fn send_message(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        tokio::time::timeout(SEND_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
 }
 
 async fn send(socket: &mut WebSocket, text: axum::extract::ws::Utf8Bytes) -> bool {
-    socket.send(Message::Text(text)).await.is_ok()
+    send_message(socket, Message::Text(text)).await
 }
 
 async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
-    let _ = socket
-        .send(Message::Close(Some(CloseFrame {
+    let _ = send_message(
+        socket,
+        Message::Close(Some(CloseFrame {
             code,
             reason: reason.into(),
-        })))
-        .await;
+        })),
+    )
+    .await;
+}
+
+async fn sleep_until_opt(t: Option<Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Wait for the `hello` frame and verify its ticket.
@@ -115,14 +181,11 @@ async fn serve(state: AppState, mut socket: WebSocket, unknown: UnknownGuard) {
         }
     };
     drop(unknown);
-    let Some(_conn) = state.rooms.conn(&ticket.sub) else {
-        let _ = send(&mut socket, frames::error(6, frames::client::HELLO)).await;
-        close(&mut socket, 1008, "too many sockets").await;
-        return;
-    };
+    let sock = state.rooms.next_sock_id();
+    // a fifth socket of the same person pushes the oldest out
+    let conn = state.rooms.conn(&ticket.sub, sock);
 
     let (out_tx, mut out_rx) = out_channel();
-    let sock = state.rooms.next_sock_id();
     let sid = ticket
         .sid
         .clone()
@@ -149,13 +212,20 @@ async fn serve(state: AppState, mut socket: WebSocket, unknown: UnknownGuard) {
         }
     };
 
-    let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
+    let mut ping = tokio::time::interval_at(
+        Instant::now() + state.cfg.ws_ping_every,
+        state.cfg.ws_ping_every,
+    );
     let (mut tokens, mut last) = (BURST, Instant::now());
+    let mut pong_deadline: Option<Instant> = None;
     loop {
         tokio::select! {
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
+                    // answers are timed from here, not from when the room
+                    // gets to the frame
                     let now = Instant::now();
+                    pong_deadline = None;
                     tokens = (tokens + (now - last).as_secs_f32() * REFILL_PER_SEC).min(BURST);
                     last = now;
                     if tokens < 1.0 {
@@ -172,10 +242,10 @@ async fn serve(state: AppState, mut socket: WebSocket, unknown: UnknownGuard) {
                         Some(ClientFrame::Hello(_)) | None => {
                             let _ = send(&mut socket, frames::error(4, 0)).await;
                         }
-                        Some(frame) => room.frame(sock, frame).await,
+                        Some(frame) => room.frame(sock, frame, now).await,
                     }
                 }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => pong_deadline = None,
                 Some(Ok(_)) | Some(Err(_)) | None => break,
             },
             out = out_rx.recv() => match out {
@@ -196,9 +266,18 @@ async fn serve(state: AppState, mut socket: WebSocket, unknown: UnknownGuard) {
                 }
             },
             _ = ping.tick() => {
-                if socket.send(Message::Ping(Default::default())).await.is_err() {
+                if !send_message(&mut socket, Message::Ping(Default::default())).await {
                     break;
                 }
+                pong_deadline.get_or_insert(Instant::now() + state.cfg.ws_pong_within);
+            }
+            _ = sleep_until_opt(pong_deadline) => {
+                close(&mut socket, 1008, "no pong").await;
+                break;
+            }
+            _ = conn.evicted() => {
+                close(&mut socket, 1008, "replaced by a newer socket").await;
+                break;
             }
         }
     }

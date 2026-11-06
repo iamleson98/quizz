@@ -108,7 +108,13 @@ async fn serve(extra: &[(&str, String)]) -> Service {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = router.clone();
-    tokio::spawn(async move { axum::serve(listener, app).await });
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     Service {
         state,
         addr,
@@ -135,13 +141,28 @@ impl Service {
 
     async fn open_with(
         &self,
+        token: &str,
+        origin: Option<&str>,
+        protocol: bool,
+    ) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
+        self.open_from(token, origin, protocol, &[]).await
+    }
+
+    /// Like `open_with`, with extra request headers (the edge's client address).
+    async fn open_from(
+        &self,
         _token: &str,
         origin: Option<&str>,
         protocol: bool,
+        headers: &[(&'static str, &str)],
     ) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
         let mut req = format!("ws://{}/ws", self.addr)
             .into_client_request()
             .unwrap();
+        for (k, v) in headers {
+            req.headers_mut()
+                .insert(*k, HeaderValue::from_str(v).unwrap());
+        }
         if let Some(o) = origin {
             req.headers_mut()
                 .insert("origin", HeaderValue::from_str(o).unwrap());
@@ -429,28 +450,31 @@ async fn the_socket_checks_origin_protocol_hello_and_ticket() {
     assert_eq!(recv(&mut ws).await, json!([8, 4, 0]));
     assert!(closed(&mut ws).await);
 
-    // saying nothing for 5 s
+    // saying nothing for 2 s
     let mut ws = s.open(&ok).await;
     let started = std::time::Instant::now();
     assert_eq!(recv(&mut ws).await, json!([8, 1, 0]));
     assert!(closed(&mut ws).await);
     assert!(
-        started.elapsed() >= Duration::from_secs(5) && started.elapsed() < Duration::from_secs(7)
+        started.elapsed() >= Duration::from_secs(2) && started.elapsed() < Duration::from_secs(4)
     );
 }
 
 #[tokio::test]
-async fn sockets_per_person_frame_size_and_rate_are_limited() {
+async fn a_fifth_socket_evicts_the_oldest_and_frame_size_and_rate_are_limited() {
     let s = serve(&[]).await;
     let token = player_ticket(&s, "student1");
     let mut held = Vec::new();
     for _ in 0..4 {
         held.push(s.join(&token).await.0);
     }
-    let mut fifth = s.open(&token).await;
-    send(&mut fifth, json!([0, token])).await;
-    assert_eq!(recv(&mut fifth).await, json!([8, 6, 0]));
-    assert!(closed(&mut fifth).await);
+    // a fifth socket is welcome: the oldest is the one that goes (a phone that
+    // lost its network must not lock the person out)
+    let (fifth, first) = s.join(&token).await;
+    assert_eq!(first[0], 0);
+    assert!(closed(&mut held[0]).await, "the oldest was pushed out");
+    held.remove(0);
+    held.push(fifth);
 
     // after hello, a long frame closes the socket
     let (mut ws, _) = held.swap_remove(0).into_pair();
@@ -982,4 +1006,142 @@ async fn a_quest_game_over_real_sockets_from_start_to_stored_results() {
     assert_eq!(players[0]["correctCount"], 1);
     assert_eq!(players[0]["bestStreak"], 1);
     assert_eq!(games[0]["questions"], json!([]));
+}
+
+#[tokio::test]
+async fn sockets_that_have_not_said_hello_are_capped_per_client_address() {
+    let s = serve(&[]).await;
+    let ok = player_ticket(&s, "student1");
+    // one school (one address) opens 64 sockets and says nothing
+    let mut waiting = Vec::new();
+    for _ in 0..64 {
+        waiting.push(
+            s.open_from(&ok, Some(SITE), true, &[("x-real-ip", "203.0.113.7")])
+                .await
+                .expect("within the cap"),
+        );
+    }
+    let over = s
+        .open_from(&ok, Some(SITE), true, &[("x-real-ip", "203.0.113.7")])
+        .await;
+    assert!(
+        over.is_err(),
+        "the 65th from that address is turned away (429)"
+    );
+    // another address is not locked out, and says hello normally
+    let (ws, first) = {
+        let mut ws = s
+            .open_from(&ok, Some(SITE), true, &[("x-real-ip", "198.51.100.9")])
+            .await
+            .expect("another address");
+        send(&mut ws, json!([0, ok])).await;
+        let first = recv(&mut ws).await;
+        (ws, first)
+    };
+    assert_eq!(first[0], 0);
+    // Cloudflare's header wins over x-real-ip: the same school behind a
+    // different edge header is the same count
+    let behind_cf = s
+        .open_from(
+            &ok,
+            Some(SITE),
+            true,
+            &[
+                ("cf-connecting-ip", "203.0.113.7"),
+                ("x-real-ip", "198.51.100.9"),
+            ],
+        )
+        .await;
+    assert!(
+        behind_cf.is_err(),
+        "cf-connecting-ip is the address that counts"
+    );
+    // a socket that says hello (or goes away) frees its slot
+    drop(waiting.pop());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        s.open_from(&ok, Some(SITE), true, &[("x-real-ip", "203.0.113.7")])
+            .await
+            .is_ok()
+    );
+    drop(ws);
+}
+
+#[tokio::test]
+async fn a_peer_that_never_answers_pings_is_dropped() {
+    let s = serve(&[
+        ("QUIZ_WS_PING_SECS", "1".into()),
+        ("QUIZ_WS_PONG_SECS", "1".into()),
+    ])
+    .await;
+    let token = player_ticket(&s, "student1");
+    let (mut ws, _) = s.join(&token).await;
+    // the client does not read, so tungstenite never answers the ping; after
+    // the ping (1 s) and the pong deadline (1 s) the server closes
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    assert!(closed(&mut ws).await, "no pong: closed");
+
+    // a peer that reads (and so answers) stays
+    let (mut live, _) = s.join(&token).await;
+    let end = tokio::time::Instant::now() + Duration::from_millis(3200);
+    while let Ok(msg) = tokio::time::timeout_at(end, live.next()).await {
+        assert!(
+            matches!(msg, Some(Ok(Message::Ping(_)))),
+            "a live socket is only pinged, never closed: {msg:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_biggest_host_frames_fit_a_socket() {
+    use axum::routing::get;
+    // the socket is tuned by `tune`, as /ws is; send it the worst frame there
+    // is: a roster or a full order of 500 players with 160-byte names
+    let names: Vec<String> = (0..500)
+        .map(|i| format!("{i:03}{}", "\u{1F600}".repeat(39)))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let roster = quiz_service::game::frames::names(&refs);
+    let podium = quiz_service::game::frames::close(quiz_service::game::frames::podium_head(
+        &refs.iter().take(3).map(|n| (*n, 1)).collect::<Vec<_>>(),
+        Some(&refs.iter().map(|n| (*n, 1)).collect::<Vec<_>>()),
+    ));
+    assert!(
+        roster.len() > 80_000 && podium.len() > 80_000,
+        "{} {}",
+        roster.len(),
+        podium.len()
+    );
+    let frames = vec![roster, podium];
+    let app = Router::new().route(
+        "/big",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let frames = frames.clone();
+            async move {
+                quiz_service::ws::tune(ws).on_upgrade(move |mut socket| async move {
+                    for f in frames {
+                        socket
+                            .send(axum::extract::ws::Message::Text(f))
+                            .await
+                            .unwrap();
+                    }
+                })
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let mut req = format!("ws://{addr}/big").into_client_request().unwrap();
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("quiz.v1"),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    for _ in 0..2 {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => assert!(t.len() > 80_000),
+            other => panic!("the big frame did not arrive: {other:?}"),
+        }
+    }
 }

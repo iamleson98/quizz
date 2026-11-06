@@ -5,15 +5,20 @@ use super::frames::Out;
 use super::room::{self, Member, RoomGone, RoomHandle};
 use super::store::GameStore;
 use crate::error::{AppError, AppResult};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
-/// Sockets one person may hold at once.
-pub const MAX_SOCKETS_PER_USER: u32 = 4;
-/// Sockets that have not said hello yet, all together.
+/// Sockets one person may hold at once: a fifth evicts the oldest.
+pub const MAX_SOCKETS_PER_USER: usize = 4;
+/// Sockets that have not said hello yet, all together (the backstop).
 pub const MAX_UNKNOWN_SOCKETS: usize = 2000;
+/// Sockets from one client address that have not said hello yet. Generous,
+/// because a school is one address (NAT) with a class behind it.
+pub const MAX_UNKNOWN_PER_IP: u32 = 64;
 
 /// What a room needs from the service around it.
 #[derive(Clone)]
@@ -34,7 +39,10 @@ struct Registry {
     rooms: HashMap<String, RoomHandle>,
     /// Sessions with a running game: host and quiz.
     running: HashMap<String, (String, i64)>,
-    conns: HashMap<String, u32>,
+    /// A person's sockets, oldest first: `(socket, how to tell it to go)`.
+    conns: HashMap<String, VecDeque<(u64, Arc<Notify>)>>,
+    /// Sockets that have not said hello yet, by client address.
+    unknown_by_ip: HashMap<IpAddr, u32>,
 }
 
 #[derive(Default)]
@@ -53,14 +61,23 @@ pub struct Rooms(Arc<Inner>);
 pub struct ConnGuard {
     rooms: Rooms,
     user: String,
+    sock: u64,
+    evicted: Arc<Notify>,
+}
+
+impl ConnGuard {
+    /// Resolves when a newer socket of the same person pushed this one out.
+    pub async fn evicted(&self) {
+        self.evicted.notified().await;
+    }
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         let mut reg = self.rooms.0.reg.lock().expect("rooms lock");
-        if let Some(n) = reg.conns.get_mut(&self.user) {
-            *n -= 1;
-            if *n == 0 {
+        if let Some(list) = reg.conns.get_mut(&self.user) {
+            list.retain(|(sock, _)| *sock != self.sock);
+            if list.is_empty() {
                 reg.conns.remove(&self.user);
             }
         }
@@ -68,12 +85,31 @@ impl Drop for ConnGuard {
 }
 
 /// Counts a socket that has not said hello yet until dropped.
-pub struct UnknownGuard(Rooms);
+pub struct UnknownGuard {
+    rooms: Rooms,
+    ip: IpAddr,
+}
 
 impl Drop for UnknownGuard {
     fn drop(&mut self) {
-        self.0.0.unknown.fetch_sub(1, Ordering::Relaxed);
+        self.rooms.0.unknown.fetch_sub(1, Ordering::Relaxed);
+        let mut reg = self.rooms.0.reg.lock().expect("rooms lock");
+        if let Some(n) = reg.unknown_by_ip.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                reg.unknown_by_ip.remove(&self.ip);
+            }
+        }
     }
+}
+
+/// Why a socket that has yet to say hello was turned away.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Turned {
+    /// Too many from this client address: it cannot lock everybody else out.
+    TooManyFromThisAddress,
+    /// Too many in all.
+    TooManyInAll,
 }
 
 impl Rooms {
@@ -81,28 +117,45 @@ impl Rooms {
         self.0.next_sock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Admit a socket that has yet to say hello, or refuse it when too many
-    /// are waiting.
-    pub fn admit_unknown(&self) -> Option<UnknownGuard> {
-        if self.0.unknown.fetch_add(1, Ordering::Relaxed) >= MAX_UNKNOWN_SOCKETS {
-            self.0.unknown.fetch_sub(1, Ordering::Relaxed);
-            return None;
-        }
-        Some(UnknownGuard(self.clone()))
-    }
-
-    /// Count a socket of `user`; `None` when they hold too many already.
-    pub fn conn(&self, user: &str) -> Option<ConnGuard> {
+    /// Admit a socket that has yet to say hello from `ip`, or turn it away
+    /// when that address already has [`MAX_UNKNOWN_PER_IP`] waiting or
+    /// [`MAX_UNKNOWN_SOCKETS`] are waiting in all.
+    pub fn admit_unknown(&self, ip: IpAddr) -> Result<UnknownGuard, Turned> {
         let mut reg = self.0.reg.lock().expect("rooms lock");
-        let n = reg.conns.entry(user.to_string()).or_insert(0);
-        if *n >= MAX_SOCKETS_PER_USER {
-            return None;
+        if self.0.unknown.load(Ordering::Relaxed) >= MAX_UNKNOWN_SOCKETS {
+            return Err(Turned::TooManyInAll);
+        }
+        let n = reg.unknown_by_ip.entry(ip).or_insert(0);
+        if *n >= MAX_UNKNOWN_PER_IP {
+            return Err(Turned::TooManyFromThisAddress);
         }
         *n += 1;
-        Some(ConnGuard {
+        self.0.unknown.fetch_add(1, Ordering::Relaxed);
+        Ok(UnknownGuard {
+            rooms: self.clone(),
+            ip,
+        })
+    }
+
+    /// Count socket `sock` of `user`. A person holds at most
+    /// [`MAX_SOCKETS_PER_USER`]: the oldest is told to go when a newer one
+    /// arrives, so a phone that lost its network never locks the person out.
+    pub fn conn(&self, user: &str, sock: u64) -> ConnGuard {
+        let mut reg = self.0.reg.lock().expect("rooms lock");
+        let list = reg.conns.entry(user.to_string()).or_default();
+        while list.len() >= MAX_SOCKETS_PER_USER {
+            if let Some((_, evict)) = list.pop_front() {
+                evict.notify_one();
+            }
+        }
+        let evicted = Arc::new(Notify::new());
+        list.push_back((sock, evicted.clone()));
+        ConnGuard {
             rooms: self.clone(),
             user: user.to_string(),
-        })
+            sock,
+            evicted,
+        }
     }
 
     /// Attach a socket to the room of `sid`, creating the room when needed.

@@ -90,6 +90,10 @@ pub struct Config {
     pub lms_url: Option<String>,
     /// Tokio worker threads: the node's SFU must keep its cores.
     pub worker_threads: usize,
+    /// Websocket ping interval (keeps proxies' idle limits away).
+    pub ws_ping_every: Duration,
+    /// How long a peer has to answer a ping before the socket is dropped.
+    pub ws_pong_within: Duration,
     /// Maximum pool connections. Each holds its own page cache, so the worst
     /// case memory is `pool_max x cache_size_kib` plus the mapped file.
     pub pool_max: u32,
@@ -228,6 +232,8 @@ impl Config {
             allowed_origins,
             lms_url,
             worker_threads,
+            ws_ping_every: Duration::from_secs(num("QUIZ_WS_PING_SECS", "25")?.max(1)),
+            ws_pong_within: Duration::from_secs(num("QUIZ_WS_PONG_SECS", "10")?.max(1)),
             pool_max,
             pool_min,
             busy_timeout_ms: num("QUIZ_BUSY_TIMEOUT_MS", "5000")?,

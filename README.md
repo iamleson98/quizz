@@ -217,6 +217,7 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
 | `QUIZ_SNAPSHOT_INTERVAL_SECS` | `900` | time between snapshot attempts |
 | `QUIZ_LMS_URL` | `http://lms-server.lms.svc.cluster.local:8065` | the LMS server (plain http) that receives lesson-time spans; empty turns pushing off |
 | `QUIZ_WORKER_THREADS` | `2` | tokio worker threads: on its node the service shares cores with the SFU |
+| `QUIZ_WS_PING_SECS` / `QUIZ_WS_PONG_SECS` | `25` / `10` | websocket ping interval, and how long a peer has to answer it |
 | `QUIZ_POOL_MAX` / `QUIZ_POOL_MIN` | `4` / `2` | sqlx pool size (each connection has its own page cache) |
 | `QUIZ_BUSY_TIMEOUT_MS` | `5000` | per-connection busy timeout |
 | `QUIZ_TX_MODE` | `concurrent` | `concurrent` \| `deferred` \| `immediate` |
@@ -231,6 +232,12 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
 
 ## Operations
 
+- **Client addresses.** The cap on game sockets that have not said hello yet (64
+  per address, 2,000 in all, hello within 2 s) needs the client's address. It is
+  read from `CF-Connecting-IP`, then `X-Real-Ip`, then the peer address. Traefik
+  passes the first two, and the edge only admits Cloudflare, so a client cannot
+  forge them; if the public listener were reachable some other way they could be
+  forged, and the peer address would be the only honest one.
 - **One replica.** The SQLite file takes an exclusive lock (`unix-excl`), so
   deploy with strategy `Recreate`. Restarting ends running games (the teacher
   starts the game again); everything already written stays. On `SIGTERM` the

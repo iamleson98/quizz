@@ -22,8 +22,29 @@ pub const AUDIENCE: &str = "quiz";
 const LEEWAY_SECS: u64 = 5;
 /// Longest accepted `sub`.
 const MAX_SUB_LEN: usize = 64;
-/// Longest display name kept.
+/// Longest display name kept, in characters...
 pub const MAX_NAME_CHARS: usize = 60;
+/// ...and in bytes (60 emoji would be 240): 500 names must fit one frame.
+pub const MAX_NAME_BYTES: usize = 160;
+
+/// A display name that is safe to show and to put in a frame: no control
+/// characters, at most [`MAX_NAME_CHARS`] characters and [`MAX_NAME_BYTES`]
+/// bytes (cut at a character boundary).
+pub fn clean_name(raw: &str) -> String {
+    let mut name = String::new();
+    for c in raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME_CHARS)
+    {
+        if name.len() + c.len_utf8() > MAX_NAME_BYTES {
+            break;
+        }
+        name.push(c);
+    }
+    name.trim().to_string()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -99,7 +120,7 @@ impl Ticket {
         };
         Ok(Ticket {
             sub: c.sub,
-            name: c.name.trim().chars().take(MAX_NAME_CHARS).collect(),
+            name: clean_name(&c.name),
             role: c.role,
             sid,
             cid,
@@ -256,6 +277,28 @@ mod tests {
             v.as_object_mut().unwrap().remove(missing);
             assert!(Ticket::verify(&dkey(), &sign(v)).is_err(), "no {missing}");
         }
+    }
+
+    #[test]
+    fn names_are_cut_by_characters_and_bytes_and_lose_control_characters() {
+        assert_eq!(clean_name("  Lan\u{0}\n\t Nguyen \u{7f}"), "Lan Nguyen");
+        assert_eq!(clean_name(&"a".repeat(100)).len(), MAX_NAME_CHARS);
+        let emoji = clean_name(&"\u{1F600}".repeat(60));
+        assert!(emoji.len() <= MAX_NAME_BYTES, "{} bytes", emoji.len());
+        assert_eq!(emoji.chars().count(), MAX_NAME_BYTES / 4);
+        // a cut never splits a character
+        assert!(String::from_utf8(emoji.clone().into_bytes()).is_ok());
+        assert_eq!(clean_name("\u{200B}\u{0}"), "\u{200B}", "only controls go");
+        let mut t = host();
+        t.name = "x".into();
+        let token = Ticket {
+            name: format!("\u{1F600}\u{0}{}", "é".repeat(200)),
+            ..t
+        }
+        .sign(&secret(), now(), now() + 600)
+        .unwrap();
+        let name = Ticket::verify(&dkey(), &token).unwrap().name;
+        assert!(name.len() <= MAX_NAME_BYTES && !name.contains('\u{0}'));
     }
 
     #[test]

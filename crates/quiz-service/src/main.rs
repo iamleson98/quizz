@@ -74,11 +74,14 @@ async fn run(cfg: Config) -> Result<(), String> {
         let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
             let _ = tcp.set_nodelay(true);
         });
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = stop.wait_for(|s| *s).await;
-            })
-            .await
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = stop.wait_for(|s| *s).await;
+        })
+        .await
     };
     info!(public = %cfg.listen_addr, internal = %cfg.internal_addr, "listening");
     let public_task = tokio::spawn(serve(

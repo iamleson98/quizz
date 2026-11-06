@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 pub(crate) const BASE: i64 = 1_800_000_000_000;
 pub(crate) const ROOM_CLOSES: i64 = BASE + 2 * 60 * 60 * 1000;
@@ -131,7 +132,7 @@ pub(crate) struct Client {
 
 impl Client {
     pub(crate) async fn send(&self, frame: ClientFrame) {
-        self.room.frame(self.sock, frame).await;
+        self.room.frame(self.sock, frame, Instant::now()).await;
     }
 
     /// Frames waiting now, as JSON.
@@ -1416,4 +1417,42 @@ async fn every_connected_person_is_rewritten_each_minute_and_a_failed_write_is_r
         "the retry got them in"
     );
     drop(p1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_is_timed_from_when_the_socket_received_it() {
+    let w = world();
+    let mut a = player(&w, 1).await;
+    let mut b = player(&w, 2).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    a.frames();
+    b.frames();
+    // both frames are received at the same instant; the room gets to them
+    // ten seconds later (a stall)
+    let received = Instant::now();
+    a.room
+        .frame(a.sock, ClientFrame::Answer { q: 1, mask: 0b0010 }, received)
+        .await;
+    b.room
+        .frame(
+            b.sock,
+            ClientFrame::Answer { q: 1, mask: 0b0010 },
+            received + Duration::from_secs(10),
+        )
+        .await;
+    adv(Duration::from_secs(10)).await;
+    beat().await;
+    let points = |frames: &[Value]| last_of(frames, 5).unwrap()[8].as_i64().unwrap();
+    let (pa, pb) = (points(&a.frames()), points(&b.frames()));
+    assert!(
+        pa >= 995,
+        "timed from receipt, not from the stalled processing: {pa}"
+    );
+    assert!(
+        (745..=755).contains(&pb),
+        "ten seconds after the question opened: {pb}"
+    );
 }

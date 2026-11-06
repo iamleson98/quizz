@@ -1060,9 +1060,11 @@ impl Room {
         role: Role,
         user: &str,
         frame: race::ClientFrame,
+        received: Instant,
     ) -> AppResult<()> {
         use race::ClientFrame as F;
-        let now = Instant::now();
+        // answers are timed from when the socket received the frame
+        let now = received;
         let pid = self.socks.get(&sock).and_then(|s| s.pid);
         let mut fx = Fx::default();
         let player = |pid: Option<usize>| pid.ok_or(AppError::Forbidden);
