@@ -10,11 +10,6 @@
 *.db-wal
 *.db-shm
 
-# Load-test runtime state
-loadtest/state.json
-loadtest/*.log
-loadtest/server*.pid
-
 # Custom SQLite build: produced by ./scripts/build-sqlite.sh (run it before
 # `cargo build`; the Dockerfile does it itself). Nothing here is committed:
 # the library is platform specific.

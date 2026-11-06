@@ -1,29 +1,26 @@
-//! quiz-service: a high performance GraphQL quiz backend on a custom-built
-//! SQLite (sqlite/sqlite `begin-concurrent` branch) linked into sqlx.
+//! quiz-service: the live quiz game and the teacher's quiz bank, on a
+//! custom-built SQLite (sqlite/sqlite `begin-concurrent` branch) linked into
+//! sqlx.
 
 pub mod auth;
+pub mod clock;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod game;
 pub mod grading;
-pub mod graphql;
 pub mod ids;
 pub mod model;
+pub mod push;
 pub mod repo;
+pub mod rest;
+pub mod retention;
+pub mod server;
+pub mod snapshot;
 pub mod state;
 pub mod telemetry;
 pub mod tx;
+pub mod ws;
 
 pub use error::AppError;
 pub use state::AppState;
-
-/// JSON body helpers used by tests and the loadgen.
-pub mod util {
-    pub fn graphql_body(query: &str) -> String {
-        serde_json::json!({ "query": query }).to_string()
-    }
-
-    pub fn graphql_body_with_vars(query: &str, variables: serde_json::Value) -> String {
-        serde_json::json!({ "query": query, "variables": variables }).to_string()
-    }
-}

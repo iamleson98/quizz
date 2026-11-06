@@ -95,6 +95,9 @@ where
 
                 match commit.await {
                     Ok(_) => {
+                        state
+                            .commits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         metrics::counter!("tx_commits_total", "mode" => mode.as_str()).increment(1);
                         metrics::histogram!("tx_duration_seconds", "mode" => mode.as_str())
                             .record(started.elapsed().as_secs_f64());

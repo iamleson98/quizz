@@ -37,6 +37,11 @@ pub fn init_metrics() -> PrometheusHandle {
                     LATENCY_BUCKETS,
                 )
                 .expect("valid latency buckets")
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Prefix("quiz_question".into()),
+                    LATENCY_BUCKETS,
+                )
+                .expect("valid latency buckets")
                 .install_recorder()
                 .expect("install prometheus recorder")
         })

@@ -1,1 +1,0 @@
-{"scenario": "write", "vus": 16, "duration_s": 25.01, "ops": 39446, "rps": 1577.1, "errors": {}, "all_ms": {"p50": 5.94, "p90": 27.37, "p99": 53.31, "max": 268.9}, "start_attempt_ms": {"p50": 4.06, "p90": 12.7, "p99": 35.17, "max": 79.89}, "submit_attempt_ms": {"p50": 8.16, "p90": 32.63, "p99": 66.03, "max": 268.9}}
