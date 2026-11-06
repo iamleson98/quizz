@@ -34,9 +34,10 @@ type Ws =
 struct Fake {
     requests: Vec<Value>,
     keys: Vec<String>,
-    /// Statuses to answer with before falling back to 204.
-    script: VecDeque<StatusCode>,
-    /// A request naming one of these sessions is answered 404.
+    /// Answers (status and body) to give before falling back to 204.
+    script: VecDeque<(StatusCode, String)>,
+    /// A request naming one of these sessions is answered 404 with the id the
+    /// Go server uses for an unknown session.
     unknown_sessions: HashSet<String>,
 }
 
@@ -46,7 +47,7 @@ async fn spans_route(
     State(fake): State<FakeState>,
     headers: HeaderMap,
     axum::Json(body): axum::Json<Value>,
-) -> StatusCode {
+) -> (StatusCode, String) {
     let mut f = fake.lock().unwrap();
     f.keys.push(
         headers
@@ -60,14 +61,26 @@ async fn spans_route(
             .contains(s["session_id"].as_str().unwrap())
     });
     f.requests.push(body);
-    if let Some(s) = f.script.pop_front() {
-        return s;
+    if let Some(answer) = f.script.pop_front() {
+        return answer;
     }
     if unknown {
-        StatusCode::NOT_FOUND
+        (StatusCode::NOT_FOUND, session_unknown_body())
     } else {
-        StatusCode::NO_CONTENT
+        (StatusCode::NO_CONTENT, String::new())
     }
+}
+
+fn session_unknown_body() -> String {
+    json!({ "id": quiz_service::push::SESSION_UNKNOWN, "message": "no such session" }).to_string()
+}
+
+/// Make the fake answer the next request with this status and body.
+fn answer_next(fake: &FakeState, status: StatusCode, body: &str) {
+    fake.lock()
+        .unwrap()
+        .script
+        .push_back((status, body.to_string()));
 }
 
 async fn fake_go() -> (String, FakeState) {
@@ -595,7 +608,7 @@ async fn a_hosts_open_span_is_resent_with_a_later_end_and_leaves_when_closed() {
 }
 
 #[tokio::test]
-async fn spans_are_retried_after_a_503_and_dropped_on_a_404() {
+async fn spans_are_retried_after_a_503_and_dropped_only_for_an_unknown_session() {
     quiz_service::telemetry::init_metrics();
     let (lms, fake) = fake_go().await;
     let state = setup_with(&[("QUIZ_LMS_URL", lms)]).await;
@@ -603,10 +616,7 @@ async fn spans_are_retried_after_a_503_and_dropped_on_a_404() {
     let st = store(&state);
 
     // 503: kept, and sent again once the server recovers
-    fake.lock()
-        .unwrap()
-        .script
-        .push_back(StatusCode::SERVICE_UNAVAILABLE);
+    answer_next(&fake, StatusCode::SERVICE_UNAVAILABLE, "");
     st.write_spans(vec![span("a", "s1", 1, 2, true)])
         .await
         .unwrap();
@@ -620,10 +630,7 @@ async fn spans_are_retried_after_a_503_and_dropped_on_a_404() {
         "still in the outbox"
     );
     let started = std::time::Instant::now();
-    fake.lock()
-        .unwrap()
-        .script
-        .push_back(StatusCode::BAD_GATEWAY);
+    answer_next(&fake, StatusCode::BAD_GATEWAY, "");
     assert!(
         pusher.drain(true).await,
         "with retry it waits (backoff) and gets through"
@@ -659,6 +666,103 @@ async fn spans_are_retried_after_a_503_and_dropped_on_a_404() {
     assert!(metrics.contains("quiz_spans_dropped_total"), "{metrics}");
     assert!(metrics.contains("quiz_spans_pushed_total"));
     assert!(metrics.contains("quiz_spans_outbox_depth"));
+}
+
+#[tokio::test]
+async fn a_refusal_that_may_pass_never_loses_a_span() {
+    let (lms, fake) = fake_go().await;
+    let state = setup_with(&[("QUIZ_LMS_URL", lms)]).await;
+    let pusher = Pusher::new(&state).unwrap();
+    let st = store(&state);
+    st.write_spans(vec![
+        span("a", "s1", 1, 2, true),
+        span("b", "s1", 3, 4, true),
+    ])
+    .await
+    .unwrap();
+
+    // 401 (the feature is off or the keys differ), 403, 429 (rate limited), an
+    // old server with no route (404 without the error id), 408, 5xx: the outbox
+    // is untouched
+    for (status, body) in [
+        (StatusCode::UNAUTHORIZED, ""),
+        (StatusCode::FORBIDDEN, ""),
+        (StatusCode::TOO_MANY_REQUESTS, ""),
+        (StatusCode::NOT_FOUND, ""),
+        (
+            StatusCode::NOT_FOUND,
+            r#"{"id":"api.context.404.app_error"}"#,
+        ),
+        (StatusCode::REQUEST_TIMEOUT, ""),
+        (StatusCode::INTERNAL_SERVER_ERROR, ""),
+    ] {
+        answer_next(&fake, status, body);
+        assert!(!pusher.drain(false).await, "{status} is not success");
+        assert_eq!(
+            spans::depth(&state.pool).await.unwrap(),
+            2,
+            "{status} kept the spans"
+        );
+    }
+    assert_eq!(
+        fake.lock().unwrap().requests.len(),
+        7,
+        "each one was one whole batch, not split"
+    );
+
+    // a 429 is waited out with backoff and then goes through
+    answer_next(&fake, StatusCode::TOO_MANY_REQUESTS, "");
+    let started = std::time::Instant::now();
+    assert!(pusher.drain(true).await);
+    assert!(
+        started.elapsed() >= Duration::from_millis(700),
+        "it backed off"
+    );
+    assert_eq!(spans::depth(&state.pool).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_malformed_batch_is_dropped_and_the_span_of_an_unknown_session_alone() {
+    let (lms, fake) = fake_go().await;
+    let state = setup_with(&[("QUIZ_LMS_URL", lms)]).await;
+    let pusher = Pusher::new(&state).unwrap();
+    let st = store(&state);
+    // 400, 413 and 422 mean the server will never take this
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    ] {
+        st.write_spans(vec![span("x", "s1", 1, 2, true)])
+            .await
+            .unwrap();
+        fake.lock()
+            .unwrap()
+            .script
+            .push_back((status, String::new()));
+        assert!(pusher.drain(false).await, "{status}");
+        assert_eq!(
+            spans::depth(&state.pool).await.unwrap(),
+            0,
+            "{status} dropped it"
+        );
+    }
+    // a batch with one span of an unknown session: only that one goes
+    fake.lock().unwrap().unknown_sessions.insert("ghost".into());
+    st.write_spans(vec![
+        span("good1", "s1", 10, 20, true),
+        span("bad", "ghost", 11, 21, true),
+        span("good2", "s1", 12, 22, true),
+    ])
+    .await
+    .unwrap();
+    assert!(pusher.drain(false).await);
+    assert_eq!(spans::depth(&state.pool).await.unwrap(), 0);
+    let accepted: HashSet<String> = sent(&fake)
+        .iter()
+        .map(|x| x["user_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(accepted.contains("good1") && accepted.contains("good2"));
 }
 
 #[tokio::test]

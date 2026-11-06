@@ -60,9 +60,10 @@ async fn run(cfg: Config) -> Result<(), String> {
 
     retention::spawn(state.clone());
     snapshot::spawn(state.clone());
-    let pusher = Pusher::new(&state);
-    if let Some(p) = Pusher::new(&state) {
-        tokio::spawn(p.run());
+    // one pusher: it runs for the life of the process and flushes at the end
+    let pusher = Pusher::new(&state).map(std::sync::Arc::new);
+    if let Some(p) = &pusher {
+        tokio::spawn(p.clone().run());
     }
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
