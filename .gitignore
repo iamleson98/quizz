@@ -15,10 +15,11 @@ loadtest/state.json
 loadtest/*.log
 loadtest/server*.pid
 
-# Custom SQLite build (reproduce with scripts/build-sqlite.sh;
-# the prebuilt artifacts are committed intentionally so `cargo build`
-# works offline, but feel free to exclude them in forks)
+# Custom SQLite build: produced by ./scripts/build-sqlite.sh (run it before
+# `cargo build`; the Dockerfile does it itself). Nothing here is committed:
+# the library is platform specific.
 /third_party/sqlite/
+/third_party/sqlite-build/
 
 # IDE / OS
 .idea/

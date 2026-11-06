@@ -79,7 +79,7 @@ every conflict (5 235 retries, **zero failed requests**). Spread writes across q
 │       └── main.rs
 ├── crates/bench/               # quiz-bench load generator (Rust)
 ├── scripts/build-sqlite.sh     # reproducible custom-SQLite build (pinned commit)
-├── third_party/sqlite-build/   # prebuilt libsqlite3.a + headers + sqlite3.pc
+├── third_party/sqlite-build/   # libsqlite3.a + headers + sqlite3.pc (generated, git-ignored)
 ├── loadtest/                   # oha/wrk recipes + tx-mode comparison script
 ├── observability/              # prometheus + grafana provisioning
 ├── Dockerfile                  # multi-stage, SQLite built from source inside
@@ -105,10 +105,11 @@ The compose stack seeds a demo quiz on first boot (`QUIZ_SEED_DEMO=1`).
 
 ## Quickstart (local)
 
-Requirements: Rust 1.85+, `cc`, `make`, `git`, `tclsh` (only if you want to rebuild SQLite —
-a prebuilt static library is committed under `third_party/sqlite-build/`).
+Requirements: Rust 1.85+, `cc`, `make`, `git`, `tclsh`. The custom SQLite is not committed
+(a static library is platform specific): build it once, then the service.
 
 ```bash
+./scripts/build-sqlite.sh
 cargo build --release
 QUIZ_DATABASE=/tmp/quiz.db QUIZ_LISTEN_ADDR=127.0.0.1:8080 RUST_LOG=info \
   ./target/release/quiz-service
