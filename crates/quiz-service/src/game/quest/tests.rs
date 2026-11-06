@@ -1242,3 +1242,42 @@ async fn one_game_per_room_and_the_race_still_works_afterwards() {
     settle().await;
     assert!(last_of(&ps[0].frames(), 1).is_some(), "the race's lobby");
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_spans_heartbeat_also_runs_while_a_quest_waits_in_the_lobby_and_on_the_podium() {
+    let q = Quest::new();
+    let p = q.player(1).await;
+    let mut h = q.host().await;
+    start(&h, 300, 0).await;
+    settle().await;
+    for _ in 0..3 {
+        adv(Duration::from_secs(61)).await;
+        h.frames();
+    }
+    let beats = |user: &str| {
+        q.w.store
+            .spans
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.user_id == user && !s.closed)
+            .count()
+    };
+    assert!(beats("teacher") >= 3, "the host, in the lobby");
+    assert!(beats("p1") >= 3, "and the player");
+
+    // on the podium after the time is up
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    for _ in 0..5 {
+        adv(Duration::from_secs(61)).await;
+        h.frames();
+    }
+    let before = beats("teacher");
+    for _ in 0..3 {
+        adv(Duration::from_secs(61)).await;
+        h.frames();
+    }
+    assert!(beats("teacher") >= before + 3, "the podium too");
+    drop(p);
+}

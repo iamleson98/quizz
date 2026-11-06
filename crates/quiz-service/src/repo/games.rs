@@ -284,7 +284,8 @@ pub struct Forgotten {
 }
 
 /// Delete everything of one person: their quizzes (with the games on them)
-/// and their name and id on player rows in other teachers' games.
+/// their name and id on player rows in other teachers' games, and their
+/// spans still in the outbox.
 pub async fn forget(conn: &mut SqliteConnection, user_id: &str) -> AppResult<Forgotten> {
     let quizzes = sqlx::query("DELETE FROM quizzes WHERE owner_id = ?1")
         .bind(user_id)
@@ -296,5 +297,10 @@ pub async fn forget(conn: &mut SqliteConnection, user_id: &str) -> AppResult<For
         .execute(&mut *conn)
         .await?
         .rows_affected();
+    // their lesson-time spans waiting to be pushed go too
+    sqlx::query("DELETE FROM spans_outbox WHERE user_id = ?1")
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await?;
     Ok(Forgotten { quizzes, players })
 }

@@ -1262,8 +1262,20 @@ impl Room {
         if spans.is_empty() {
             return;
         }
-        if let Err(e) = self.deps.store.write_spans(spans).await {
-            tracing::error!(error = %e, "writing lesson-time spans failed");
+        // lesson time must not be lost to a busy moment: try twice, and say
+        // loudly (log and counter) when the outbox cannot take them
+        for attempt in 1..=2 {
+            match self.deps.store.write_spans(spans.clone()).await {
+                Ok(()) => return,
+                Err(e) if attempt == 1 => {
+                    tracing::warn!(error = %e, "writing lesson-time spans failed, trying again");
+                }
+                Err(e) => {
+                    metrics::counter!("quiz_spans_write_failures_total")
+                        .increment(spans.len() as u64);
+                    tracing::error!(error = %e, spans = spans.len(), "writing lesson-time spans failed twice: they are lost");
+                }
+            }
         }
     }
 }

@@ -3,9 +3,12 @@
 //! A person with at least one socket attached has an open span. When the
 //! last socket goes the span waits for [`BRIDGE`]: a reconnect within it
 //! extends the same span (the short gap counts, as it does for the call),
-//! otherwise the span is closed at the moment the person left. The host's
-//! open span is written to the outbox every [`HOST_EVERY`] with its end so
-//! far, so a lost service costs at most that minute.
+//! otherwise the span is closed at the moment the person left. Every open
+//! span (the host's and each connected player's) is written to the outbox
+//! every [`HEARTBEAT_EVERY`] with its end so far, so a crash of the service, or
+//! a Go server that cannot be reached at the end of the lesson, costs at most
+//! that minute of attendance: the Go server keeps the largest end it was told
+//! and a replay is idempotent.
 
 use crate::auth::Role;
 use crate::repo::spans::Span;
@@ -15,8 +18,8 @@ use tokio::time::Instant;
 
 /// A reconnect within this long extends the span instead of opening one.
 pub const BRIDGE: Duration = Duration::from_secs(60);
-/// How often a host's open span is rewritten with its end so far.
-pub const HOST_EVERY: Duration = Duration::from_secs(60);
+/// How often the open spans are rewritten with their end so far.
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 /// How often the book looks for work.
 const TICK: Duration = Duration::from_secs(15);
 
@@ -35,7 +38,7 @@ pub struct SpanBook {
     enabled: bool,
     open: HashMap<String, Open>,
     pub next_tick: Instant,
-    host_written: Instant,
+    heartbeat_written: Instant,
 }
 
 impl Default for SpanBook {
@@ -47,7 +50,7 @@ impl Default for SpanBook {
             enabled: false,
             open: HashMap::new(),
             next_tick: now,
-            host_written: now,
+            heartbeat_written: now,
         }
     }
 }
@@ -61,7 +64,7 @@ impl SpanBook {
             enabled,
             open: HashMap::new(),
             next_tick: now + TICK,
-            host_written: now,
+            heartbeat_written: now,
         };
     }
 
@@ -108,11 +111,12 @@ impl SpanBook {
     }
 
     /// Spans to write now: those whose bridge ran out, closed at the moment
-    /// the person left, and the host's open span when its minute is up.
+    /// the person left, and every connected person's open span when the minute
+    /// is up.
     pub fn tick(&mut self, wall: i64, now: Instant) -> Vec<Span> {
         self.next_tick = now + TICK;
         let mut out = Vec::new();
-        let write_host = now.saturating_duration_since(self.host_written) >= HOST_EVERY;
+        let heartbeat = now.saturating_duration_since(self.heartbeat_written) >= HEARTBEAT_EVERY;
         let expired: Vec<String> = self
             .open
             .iter()
@@ -127,12 +131,11 @@ impl SpanBook {
                 out.push(self.span(&user, &o, o.to, true));
             }
         }
-        if write_host {
-            self.host_written = now;
+        if heartbeat {
+            self.heartbeat_written = now;
             for (user, o) in &self.open {
-                if o.role == Role::Host {
-                    let to = if o.live > 0 { wall } else { o.to };
-                    out.push(self.span(user, o, to, false));
+                if o.live > 0 {
+                    out.push(self.span(user, o, wall, false));
                 }
             }
         }
@@ -184,8 +187,8 @@ mod tests {
         b.attach("p1", Role::Player, 41_000);
         tokio::time::advance(Duration::from_secs(70)).await;
         assert!(
-            b.tick(111_000, Instant::now()).is_empty(),
-            "still connected"
+            b.tick(111_000, Instant::now()).iter().all(|s| !s.closed),
+            "still connected: nothing is closed"
         );
         b.detach("p1", 120_000, Instant::now());
         let closed = b.close_all(120_000);
@@ -203,6 +206,27 @@ mod tests {
         assert_eq!(
             (spans[0].role.as_str(), spans[0].to_ms, spans[0].closed),
             ("host", 61_000, false)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn players_are_rewritten_every_minute_too_while_connected() {
+        let mut b = book(Instant::now());
+        b.attach("p1", Role::Player, 0);
+        b.attach("p2", Role::Player, 0);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        b.detach("p2", 20_000, Instant::now());
+        tokio::time::advance(Duration::from_secs(41)).await;
+        let spans = b.tick(61_000, Instant::now());
+        let p1: Vec<_> = spans.iter().filter(|s| s.user_id == "p1").collect();
+        assert_eq!(p1.len(), 1, "{spans:?}");
+        assert_eq!(
+            (p1[0].role.as_str(), p1[0].to_ms, p1[0].closed),
+            ("player", 61_000, false)
+        );
+        assert!(
+            spans.iter().all(|s| s.user_id != "p2"),
+            "gone for 41 s: still bridged, not written"
         );
     }
 

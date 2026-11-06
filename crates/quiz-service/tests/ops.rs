@@ -546,3 +546,68 @@ async fn snapshots_are_atomic_and_the_gauge_advances_even_when_nothing_changed()
     assert_eq!(snap.run_once(&state).await.unwrap(), Outcome::Written);
     assert!(snapshot_gauge() >= second + 15.0 * 60.0 - 1.0);
 }
+
+#[tokio::test]
+async fn orphaned_spans_are_closed_at_startup_and_a_forgotten_person_leaves_the_outbox() {
+    use quiz_service::repo::spans::{self, Span};
+    let state = setup().await;
+    let span = |user: &str, closed: bool, to: i64| Span {
+        game_id: 5,
+        user_id: user.into(),
+        session_id: "s1".into(),
+        role: "player".into(),
+        from_ms: 100,
+        to_ms: to,
+        closed,
+    };
+    let store = DbStore {
+        state: state.clone(),
+        spans_ready: state.spans_ready.clone(),
+    };
+    store
+        .write_spans(vec![
+            span("open-unsent", false, 500),
+            span("open-acked", false, 400),
+            span("student1", false, 300),
+        ])
+        .await
+        .unwrap();
+    // one of them was acknowledged up to its end already
+    sqlx::query("UPDATE spans_outbox SET pushed_ms = 400 WHERE user_id = 'open-acked'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    retention::close_orphaned_games(&state, state.now_ms())
+        .await
+        .unwrap();
+    let pending = spans::pending(&state.pool, 10).await.unwrap();
+    let mut users: Vec<&str> = pending.iter().map(|s| s.user_id.as_str()).collect();
+    users.sort_unstable();
+    assert_eq!(users, vec!["open-unsent", "student1"]);
+    assert!(
+        pending.iter().all(|s| s.closed),
+        "their last heartbeat is their end"
+    );
+    assert_eq!(
+        spans::depth(&state.pool).await.unwrap(),
+        2,
+        "the acknowledged one left"
+    );
+
+    let internal = internal_router(state.clone(), telemetry::init_metrics());
+    call(
+        &internal,
+        "POST",
+        "/internal/users/student1/forget",
+        None,
+        None,
+        &[("x-internal-key", INTERNAL_KEY)],
+    )
+    .await;
+    assert_eq!(
+        spans::depth(&state.pool).await.unwrap(),
+        1,
+        "the forgotten person's spans are purged"
+    );
+}

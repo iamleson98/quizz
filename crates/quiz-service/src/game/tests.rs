@@ -28,6 +28,8 @@ pub(crate) struct FakeStore {
     pub(crate) batches: Mutex<Vec<Batch>>,
     pub(crate) spans: Mutex<Vec<Span>>,
     pub(crate) fail_writes: Mutex<bool>,
+    /// How many of the next span writes fail.
+    pub(crate) fail_span_writes: Mutex<u32>,
 }
 
 impl GameStore for FakeStore {
@@ -58,6 +60,11 @@ impl GameStore for FakeStore {
     }
     fn write_spans(&self, spans: Vec<Span>) -> BoxFuture<'_, AppResult<()>> {
         Box::pin(async move {
+            let mut failing = self.fail_span_writes.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                return Err(AppError::Internal("busy".into()));
+            }
             self.spans.lock().unwrap().extend(spans);
             Ok(())
         })
@@ -1378,4 +1385,35 @@ async fn the_host_keeps_seeing_the_provisional_ranking_until_the_reveal() {
     assert!(last_of(&f, 4).is_some(), "the ranking up to the close");
     assert_eq!(last_of(&f, 11).unwrap(), &json!([11, 1]));
     assert!(last_of(&f, 5).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_connected_person_is_rewritten_each_minute_and_a_failed_write_is_retried() {
+    let w = world();
+    let p1 = player(&w, 1).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    for _ in 0..3 {
+        adv(Duration::from_secs(61)).await;
+    }
+    {
+        let spans = w.store.spans.lock().unwrap();
+        for user in ["teacher", "p1"] {
+            let beats = spans
+                .iter()
+                .filter(|s| s.user_id == user && !s.closed)
+                .count();
+            assert!(beats >= 3, "{user} was written {beats} times: {spans:?}");
+        }
+    }
+    // the outbox is busy once: the write is tried again
+    *w.store.fail_span_writes.lock().unwrap() = 1;
+    let before = w.store.spans.lock().unwrap().len();
+    adv(Duration::from_secs(61)).await;
+    assert!(
+        w.store.spans.lock().unwrap().len() > before,
+        "the retry got them in"
+    );
+    drop(p1);
 }

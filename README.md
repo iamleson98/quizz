@@ -249,12 +249,23 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
   and `POST`s them to `QUIZ_LMS_URL` + `/api/v4/lms/internal/quiz/spans`, header
   `x-internal-key`, body `{"spans":[{"game_id","session_id","user_id","role",
   "from","to"}]}` (`game_id` a decimal string, times in ms), at most 500 a
-  request, answer 204. A host's open span is re-sent every 60 s with its end so
-  far; a player's is sent when it closes (disconnect, game end, `rc`, shutdown).
-  A reconnect within 60 s extends the span. The call is idempotent by (game,
-  user, from) and a span's end only grows. Network errors and 5xx are retried
-  with exponential backoff and jitter (1 s to 5 min); a 404 or any other 4xx
-  drops the span (counted).
+  request, answer 204. Every open span (the host's and each connected player's)
+  is re-sent every 60 s with its end so far, and a span is sent for good when it
+  closes (disconnect, game end, `rc`, shutdown), so a crash of the service or an
+  unreachable Go server at the end of a lesson costs at most a minute of
+  attendance. A reconnect within 60 s extends the span; spans left open by a
+  crash are closed at the next start. The call is idempotent by (game, user,
+  from) and a span's end only grows. **Only what the server will certainly never
+  take is dropped** (and counted in `quiz_spans_dropped_total`): a malformed or
+  too large batch (400, 413, 422) and a span of a session the server says it
+  does not know (a 404 whose body id is
+  `app.lms.quiz.spans.session_unknown.app_error`). Everything else (401 when the
+  feature is off or the keys differ, 403, 408, 429, any other 404 such as an
+  older server without the route, 5xx, network errors) is retried with
+  exponential backoff and jitter (1 s to 5 min) and leaves the outbox
+  untouched. **Alert on `increase(quiz_spans_dropped_total[1h]) > 0`**: a dropped
+  span is lost lesson time. `quiz_spans_write_failures_total` counts spans the
+  outbox itself could not take (after one retry).
 - **Metrics** (internal `/metrics`): `quiz_games_running`,
   `quiz_players_connected`, `quiz_answers_total`,
   `quiz_question_close_seconds` (histogram), `tx_commits_total`,

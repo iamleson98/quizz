@@ -1117,7 +1117,9 @@ impl Room {
 
     pub(super) fn quest_next_wake(&self) -> Option<Instant> {
         let q = self.quest.as_ref()?;
-        q.next_wake()
+        // the spans' heartbeat also runs while the quest waits in the lobby
+        // or on the podium
+        q.next_wake().min(Some(self.spans.next_tick))
     }
 
     pub(super) async fn quest_on_timer(&mut self) {
