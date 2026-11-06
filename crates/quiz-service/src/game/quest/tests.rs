@@ -1172,9 +1172,10 @@ async fn at_the_end_the_podium_is_shown_and_the_results_are_stored_in_one_write(
     reply(&ps[0], &now_cur[0], right_mask(now_cur[0].id)).await;
     settle().await;
     assert_eq!(ps[0].frames(), vec![json!([8, 5, 6])]);
-    assert!(
-        q.w.store.batches.lock().unwrap().is_empty(),
-        "still nothing written"
+    assert_eq!(
+        q.w.store.batches.lock().unwrap().len(),
+        1,
+        "the results were stored when the podium opened"
     );
 
     h.send(ClientFrame::Next).await;
@@ -1218,8 +1219,12 @@ async fn the_host_can_end_a_quest_early_and_it_ends_by_itself_at_the_room_close(
     let (mut h, mut ps, _) = running(&q, 2, 0).await;
     h.send(ClientFrame::End).await;
     settle().await;
+    // ending a game in play shows the podium; a second end ends it
+    assert!(last_of(&ps[0].frames(), 6).is_some());
+    h.send(ClientFrame::End).await;
+    settle().await;
     assert_eq!(last_of(&ps[0].frames(), 7).unwrap(), &json!([7, 0]));
-    assert_eq!(q.w.store.batches.lock().unwrap().len(), 1);
+    assert_eq!(q.w.store.batches.lock().unwrap().len(), 1, "stored once");
     h.frames();
 
     // a new game can follow in the same room, and the room's close ends it
@@ -1232,7 +1237,7 @@ async fn the_host_can_end_a_quest_early_and_it_ends_by_itself_at_the_room_close(
     assert!(last_of(&ps[0].frames(), 6).is_some());
     adv(Duration::from_secs(60 * 60 + 5)).await; // idle for an hour
     assert_eq!(last_of(&ps[0].frames(), 7).unwrap(), &json!([7, 2]));
-    assert_eq!(q.w.store.batches.lock().unwrap().len(), 2);
+    assert_eq!(q.w.store.batches.lock().unwrap().len(), 2, "one per game");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1244,7 +1249,8 @@ async fn one_game_per_room_and_the_race_still_works_afterwards() {
     settle().await;
     let f = h.frames();
     assert_eq!(f.iter().filter(|f| **f == json!([8, 5, 1])).count(), 2);
-    h.send(ClientFrame::End).await;
+    h.send(ClientFrame::End).await; // the podium
+    h.send(ClientFrame::End).await; // the end
     settle().await;
     ps[0].frames();
     // a race on the same quiz in the same room, afterwards
@@ -1385,4 +1391,121 @@ async fn an_answer_received_after_the_end_of_the_game_is_refused_even_before_the
         )
         .is_ok()
     );
+}
+
+/// Batches that carry the end of a game.
+fn ended_writes(q: &Quest) -> usize {
+    q.w.store
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| b.ended_at.is_some())
+        .count()
+}
+
+fn closed_spans(q: &Quest) -> usize {
+    q.w.store
+        .spans
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.closed)
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn ending_a_quest_in_play_shows_the_podium_stores_the_results_once_and_ends_on_the_next_end()
+{
+    let q = Quest::new();
+    let (mut h, mut ps, cur) = running(&q, 3, 0).await;
+    // p1 answers right (the chest is left unopened), p2 wrong
+    q.chests(1, [Outcome::Jackpot; 3]);
+    reply(&ps[0], &cur[0], right_mask(cur[0].id)).await;
+    reply(&ps[1], &cur[1], wrong_mask(cur[1].id)).await;
+    settle().await;
+    for c in ps.iter_mut() {
+        c.frames();
+    }
+    h.frames();
+    assert_eq!(ended_writes(&q), 0);
+
+    h.send(ClientFrame::End).await;
+    settle().await;
+    // the podium: coins as the score, the full order for the host, players
+    // their top three and their own place; the game is not over yet
+    let f = ps[0].frames();
+    let podium = last_of(&f, 6).expect("a podium");
+    assert_eq!(podium[1][0][0], json!("name-p1"));
+    assert!(
+        podium[1][0][1].as_i64().unwrap() >= 10,
+        "the answer's coins"
+    );
+    assert_eq!(
+        podium.as_array().unwrap().len(),
+        4,
+        "top three, coins, rank"
+    );
+    assert_eq!(
+        last_of(&h.frames(), 6).unwrap().as_array().unwrap().len(),
+        3
+    );
+    assert!(last_of(&f, 7).is_none(), "not ended yet");
+    assert_eq!(ended_writes(&q), 1, "stored when the podium opened");
+    assert_eq!(
+        closed_spans(&q),
+        0,
+        "the spans stay open until the game ends"
+    );
+    // answers no longer count
+    reply(&ps[2], &cur[2], right_mask(cur[2].id)).await;
+    settle().await;
+    assert_eq!(last_of(&ps[2].frames(), 8).unwrap(), &json!([8, 5, 6]));
+
+    // pressing end again ends it, and nothing is stored a second time
+    h.send(ClientFrame::End).await;
+    settle().await;
+    assert_eq!(last_of(&ps[0].frames(), 7).unwrap(), &json!([7, 0]));
+    assert_eq!(ended_writes(&q), 1, "stored exactly once");
+    assert!(
+        closed_spans(&q) >= 4,
+        "host and three players: closed when the game ends"
+    );
+    assert!(q.w.deps.rooms.running_quiz_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ending_a_quest_in_the_lobby_ends_it_at_once() {
+    let q = Quest::new();
+    let mut p = q.player(1).await;
+    let mut h = q.host().await;
+    start(&h, 300, 0).await;
+    settle().await;
+    p.frames();
+    h.send(ClientFrame::End).await;
+    settle().await;
+    let f = p.frames();
+    assert_eq!(last_of(&f, 7).unwrap(), &json!([7, 0]));
+    assert!(last_of(&f, 6).is_none(), "nothing was played: no podium");
+    assert_eq!(ended_writes(&q), 1);
+    h.frames();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_room_closing_or_idleness_during_the_podium_ends_a_quest_without_a_second_write() {
+    let q = Quest::new();
+    let (mut h, mut ps, _) = running(&q, 2, 0).await;
+    h.send(ClientFrame::End).await;
+    settle().await;
+    ps[0].frames();
+    assert_eq!(ended_writes(&q), 1);
+    for _ in 0..70 {
+        adv(Duration::from_secs(60)).await;
+        h.frames();
+        ps[0].frames();
+        ps[1].frames();
+    }
+    // an hour without a command: the end
+    assert_eq!(ended_writes(&q), 1, "still one write");
+    assert!(closed_spans(&q) >= 3);
 }

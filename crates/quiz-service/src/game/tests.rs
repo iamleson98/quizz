@@ -1456,3 +1456,197 @@ async fn an_answer_is_timed_from_when_the_socket_received_it() {
         "ten seconds after the question opened: {pb}"
     );
 }
+
+fn ended_writes(w: &World) -> usize {
+    w.store
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| b.ended_at.is_some())
+        .count()
+}
+
+fn stored_answers(w: &World) -> usize {
+    w.store
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| b.answers.len())
+        .sum()
+}
+
+fn closed_spans(w: &World) -> usize {
+    w.store
+        .spans
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.closed)
+        .count()
+}
+
+/// A race with a host and three players, question 1 open, p1 right and p2
+/// wrong; p3 has not answered.
+async fn race_with_two_answers() -> (World, Client, Vec<Client>) {
+    let w = world();
+    let mut ps = vec![
+        player(&w, 1).await,
+        player(&w, 2).await,
+        player(&w, 3).await,
+    ];
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    adv(Duration::from_secs(2)).await;
+    answer(&ps[0], 1, 0b0010).await;
+    answer(&ps[1], 1, 0b0001).await;
+    settle().await;
+    for p in ps.iter_mut() {
+        p.frames();
+    }
+    h.frames();
+    (w, h, ps)
+}
+
+/// What the end of a game in play must look like: the podium for everyone,
+/// no reveal, no end yet, the results stored once.
+fn assert_podium_and_not_over(frames: &[Value], host_frames: &[Value]) {
+    assert!(last_of(frames, 6).is_some(), "the podium: {frames:?}");
+    assert!(last_of(frames, 7).is_none(), "the game is not over yet");
+    assert!(
+        last_of(frames, 5).is_none(),
+        "no reveal on the way: {frames:?}"
+    );
+    assert_eq!(
+        last_of(host_frames, 6).unwrap().as_array().unwrap().len(),
+        3,
+        "the full order for the host"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ending_a_race_during_a_question_closes_it_shows_the_podium_and_ends_on_the_next_end() {
+    let (w, mut h, mut ps) = race_with_two_answers().await;
+    assert_eq!(ended_writes(&w), 0);
+    h.send(ClientFrame::End).await;
+    settle().await;
+    let (f, fh) = (ps[0].frames(), h.frames());
+    assert_podium_and_not_over(&f, &fh);
+    // the podium has the players' tail: score and rank; p1 (right) leads
+    let podium = last_of(&f, 6).unwrap();
+    assert_eq!(podium[1][0][0], json!("name-p1"));
+    assert_eq!(podium.as_array().unwrap().len(), 4);
+    assert_eq!(
+        stored_answers(&w),
+        2,
+        "the open question's answers were stored"
+    );
+    assert_eq!(ended_writes(&w), 1, "the results are stored once, now");
+    assert_eq!(closed_spans(&w), 0, "spans stay open until the game ends");
+    // answers no longer count
+    answer(&ps[2], 1, 0b0010).await;
+    settle().await;
+    assert_eq!(ps[2].frames().last().unwrap(), &json!([8, 5, 4]));
+
+    // a second end ends it
+    h.send(ClientFrame::End).await;
+    settle().await;
+    assert_eq!(last_of(&ps[0].frames(), 7).unwrap(), &json!([7, 0]));
+    assert_eq!(ended_writes(&w), 1, "still stored exactly once");
+    assert_eq!(stored_answers(&w), 2);
+    assert!(
+        closed_spans(&w) >= 4,
+        "host and three players closed at the end"
+    );
+    assert!(w.deps.rooms.running_quiz_ids().is_empty());
+    // nothing to end any more
+    h.send(ClientFrame::End).await;
+    settle().await;
+    assert_eq!(last_of(&h.frames(), 8).unwrap(), &json!([8, 3, 3]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ending_a_race_during_the_closing_beat_stores_the_answers_and_shows_the_podium() {
+    let (w, mut h, mut ps) = race_with_two_answers().await;
+    answer(&ps[2], 1, 0b0010).await; // everyone answered: closed, the beat runs
+    settle().await;
+    assert!(last_of(&ps[0].frames(), 11).is_some());
+    h.frames();
+    h.send(ClientFrame::End).await;
+    settle().await;
+    let (f, fh) = (ps[0].frames(), h.frames());
+    assert_podium_and_not_over(&f, &fh);
+    assert_eq!(stored_answers(&w), 3);
+    // the beat's own timer later finds nothing to reveal
+    beat().await;
+    assert!(ps[0].frames().iter().all(|f| kind(f) != 5));
+    assert_eq!(stored_answers(&w), 3, "no second write of the answers");
+    h.send(ClientFrame::Next).await; // leaving the podium
+    settle().await;
+    assert_eq!(last_of(&ps[1].frames(), 7).unwrap(), &json!([7, 0]));
+    assert_eq!(ended_writes(&w), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ending_a_race_during_a_reveal_shows_the_podium() {
+    let (w, mut h, mut ps) = race_with_two_answers().await;
+    h.send(ClientFrame::Next).await; // closes
+    h.send(ClientFrame::Next).await; // reveals at once
+    settle().await;
+    assert!(last_of(&ps[0].frames(), 5).is_some());
+    h.frames();
+    assert_eq!(stored_answers(&w), 2);
+    h.send(ClientFrame::End).await;
+    settle().await;
+    let (f, fh) = (ps[0].frames(), h.frames());
+    assert!(last_of(&f, 6).is_some() && last_of(&f, 7).is_none());
+    assert_eq!(last_of(&fh, 6).unwrap().as_array().unwrap().len(), 3);
+    assert_eq!(ended_writes(&w), 1);
+    h.send(ClientFrame::End).await;
+    settle().await;
+    assert_eq!(last_of(&ps[0].frames(), 7).unwrap(), &json!([7, 0]));
+    assert_eq!(ended_writes(&w), 1);
+    assert_eq!(stored_answers(&w), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ending_a_race_in_the_lobby_ends_it_at_once() {
+    let w = world();
+    let mut p = player(&w, 1).await;
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    p.frames();
+    h.send(ClientFrame::End).await;
+    settle().await;
+    let f = p.frames();
+    assert_eq!(last_of(&f, 7).unwrap(), &json!([7, 0]));
+    assert!(last_of(&f, 6).is_none(), "nothing was played: no podium");
+    assert_eq!(ended_writes(&w), 1);
+    assert!(closed_spans(&w) >= 2);
+    h.frames();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_race_podium_ends_by_itself_after_an_hour_with_one_write() {
+    let (w, mut h, mut ps) = race_with_two_answers().await;
+    h.send(ClientFrame::End).await;
+    settle().await;
+    for _ in 0..70 {
+        adv(Duration::from_secs(60)).await;
+        h.frames();
+        for p in ps.iter_mut() {
+            p.frames();
+        }
+    }
+    assert_eq!(
+        ended_writes(&w),
+        1,
+        "the idle end does not store a second time"
+    );
+    assert!(closed_spans(&w) >= 4);
+    assert!(w.deps.rooms.running_quiz_ids().is_empty());
+}

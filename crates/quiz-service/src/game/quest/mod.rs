@@ -143,6 +143,9 @@ pub(super) struct Quest {
     podium: Option<(Utf8Bytes, Utf8Bytes)>,
     rc_at: Instant,
     idle_at: Instant,
+    /// The results were written (with the end of the game) when the podium
+    /// opened: the end of the game does not write them again.
+    stored: bool,
 }
 
 impl Quest {
@@ -193,6 +196,7 @@ impl Quest {
             podium: None,
             rc_at,
             idle_at: now + IDLE_LIMIT,
+            stored: false,
         }
     }
 
@@ -1108,8 +1112,17 @@ impl Room {
                 let wall = self.wall(now);
                 let q = self.quest.as_mut().expect("a quest game");
                 match (frame, q.phase) {
-                    (F::End, _) | (_, QPhase::Podium) => {
+                    // nothing was played, or the podium is leaving: it ends
+                    (F::End, QPhase::Lobby) | (_, QPhase::Podium) => {
                         self.quest_finish(EndReason::Host).await;
+                        return Ok(());
+                    }
+                    // ending a game that is being played shows the podium,
+                    // as the clock running out does
+                    (F::End, QPhase::Running { .. }) => {
+                        q.time_up(&mut fx);
+                        self.apply_fx(fx);
+                        self.quest_store().await;
                         return Ok(());
                     }
                     (_, QPhase::Lobby) => q.begin(now, wall, &mut fx),
@@ -1167,9 +1180,13 @@ impl Room {
                 q.standings(now, &mut fx);
             }
         }
+        let podium = q.phase == QPhase::Podium && !q.stored;
         let (rc_at, idle_at) = (q.rc_at, q.idle_at);
         self.apply_fx(fx);
         self.schedule_flush();
+        if podium {
+            self.quest_store().await;
+        }
         if now >= rc_at {
             self.quest_finish(EndReason::RoomClosed).await;
         } else if now >= idle_at {
@@ -1203,11 +1220,15 @@ impl Room {
         }
     }
 
-    /// End the game: store the results in one transaction, close the spans,
-    /// tell everyone.
-    pub(super) async fn quest_finish(&mut self, reason: EndReason) {
-        let Some(q) = self.quest.take() else { return };
+    /// Store the results, in one transaction, with the end of the game. Done
+    /// once, when the podium opens however it opened; the end of the game
+    /// finds them stored.
+    pub(super) async fn quest_store(&mut self) {
         let ended_at = self.now_wall();
+        let Some(q) = self.quest.as_mut() else { return };
+        if q.stored {
+            return;
+        }
         let players: Vec<PlayerWrite> = q
             .players
             .iter()
@@ -1230,9 +1251,25 @@ impl Room {
             answers: Vec::new(),
             ended_at: Some(ended_at),
         };
-        if let Err(e) = self.deps.store.write(batch).await {
-            tracing::error!(error = %e, game = q.id, "writing the quest results failed");
+        let id = q.id;
+        match self.deps.store.write(batch).await {
+            Ok(()) => {
+                if let Some(q) = self.quest.as_mut() {
+                    q.stored = true;
+                }
+            }
+            Err(e) => tracing::error!(error = %e, game = id, "writing the quest results failed"),
         }
+    }
+
+    /// End the game: store the results (unless the podium already did), close
+    /// the spans, tell everyone.
+    pub(super) async fn quest_finish(&mut self, reason: EndReason) {
+        self.quest_store().await;
+        if self.quest.take().is_none() {
+            return;
+        }
+        let ended_at = self.now_wall();
         let closed = self.spans.close_all(ended_at);
         self.write_spans(closed).await;
         for s in self.socks.values_mut() {

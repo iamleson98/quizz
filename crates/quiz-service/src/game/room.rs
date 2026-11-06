@@ -206,6 +206,9 @@ struct Game {
     idle_at: Instant,
     /// The reveal frame without its closing bracket, once revealed.
     reveal: Option<Utf8Bytes>,
+    /// The results were written (with the end of the game) when the podium
+    /// opened: the end of the game does not write them again.
+    stored: bool,
     /// The podium frame for players (open) and for the host (complete).
     podium: Option<(Utf8Bytes, Utf8Bytes)>,
 }
@@ -721,6 +724,7 @@ impl Room {
             rc_at,
             idle_at: now + IDLE_LIMIT,
             reveal: None,
+            stored: false,
             podium: None,
         };
         self.spans.begin(id, &self.sid, self.deps.track_spans, now);
@@ -967,15 +971,33 @@ impl Room {
             Phase::Question => self.close_question().await,
             Phase::Closing => self.reveal_question().await,
             Phase::Reveal if qi + 1 < total => self.open_question(qi + 1),
-            Phase::Reveal => self.open_podium(),
+            Phase::Reveal => self.open_podium().await,
             Phase::Podium => self.finish(EndReason::Host).await,
         }
         Ok(())
     }
 
+    /// The host ends the game. Before anything was played that ends it at
+    /// once; during play it goes to the podium exactly as the natural end
+    /// does (the open question is closed and scored first, the results are
+    /// stored once); from the podium it ends the game.
     async fn end(&mut self, role: Role, user: &str) -> AppResult<()> {
-        self.host_game(role, user)?;
-        self.finish(EndReason::Host).await;
+        let g = self.host_game(role, user)?;
+        let phase = g.phase;
+        self.touch();
+        match phase {
+            Phase::Lobby | Phase::Podium => self.finish(EndReason::Host).await,
+            Phase::Question | Phase::Closing => {
+                if let Some(g) = &mut self.game {
+                    g.phase = Phase::Closing;
+                }
+                // scored and stored, without a closed frame or a reveal: the
+                // podium follows at once
+                self.score_question(false).await;
+                self.open_podium().await;
+            }
+            Phase::Reveal => self.open_podium().await,
+        }
         Ok(())
     }
 
@@ -1098,6 +1120,12 @@ impl Room {
     /// Reveal a closed question: score the answers, rank the players, send
     /// the reveal and write the answers in one transaction.
     async fn reveal_question(&mut self) {
+        self.score_question(true).await;
+    }
+
+    /// Score a closed question and write its answers; with `announce` the
+    /// reveal goes out to every socket.
+    async fn score_question(&mut self, announce: bool) {
         let started = std::time::Instant::now();
         let Some(g) = &mut self.game else { return };
         if g.phase != Phase::Closing {
@@ -1154,18 +1182,23 @@ impl Room {
         let host_frame = frames::close(head.clone());
         let head = Utf8Bytes::from(head);
         g.reveal = Some(head.clone());
-        self.broadcast(|s, room| {
-            let g = room.game.as_ref()?;
-            Some(match s.pid {
-                Some(pid) => Out::Open(head.clone(), reveal_tail(&g.players[pid])),
-                None => Out::Plain(host_frame.clone()),
-            })
-        });
+        if announce {
+            self.broadcast(|s, room| {
+                let g = room.game.as_ref()?;
+                Some(match s.pid {
+                    Some(pid) => Out::Open(head.clone(), reveal_tail(&g.players[pid])),
+                    None => Out::Plain(host_frame.clone()),
+                })
+            });
+        }
         self.persist(None).await;
         metrics::histogram!("quiz_question_close_seconds").record(started.elapsed().as_secs_f64());
     }
 
-    fn open_podium(&mut self) {
+    /// The podium: the final standings go out and the results are stored,
+    /// once. The game itself ends when the host leaves the podium (or the room
+    /// closes, or it has been idle).
+    async fn open_podium(&mut self) {
         let Some(g) = &mut self.game else { return };
         g.phase = Phase::Podium;
         rank(g);
@@ -1189,6 +1222,12 @@ impl Room {
                 None => Out::Plain(host_frame.clone()),
             })
         });
+        let ended_at = self.now_wall();
+        if self.persist(Some(ended_at)).await
+            && let Some(g) = &mut self.game
+        {
+            g.stored = true;
+        }
     }
 
     /// End the game: write everything that is left, close the spans, tell
@@ -1209,7 +1248,10 @@ impl Room {
             self.reveal_question().await;
         }
         let ended_at = self.now_wall();
-        self.persist(Some(ended_at)).await;
+        // the results were stored when the podium opened
+        if !self.game.as_ref().is_some_and(|g| g.stored) {
+            self.persist(Some(ended_at)).await;
+        }
         let closed = self.spans.close_all(ended_at);
         self.write_spans(closed).await;
         self.game = None;
@@ -1224,8 +1266,8 @@ impl Room {
 
     /// Write the dirty players and the answers waiting (and the end of the
     /// game). A failed write keeps them for the next one.
-    async fn persist(&mut self, ended_at: Option<i64>) {
-        let Some(g) = &mut self.game else { return };
+    async fn persist(&mut self, ended_at: Option<i64>) -> bool {
+        let Some(g) = &mut self.game else { return true };
         let players: Vec<PlayerWrite> = g
             .players
             .iter()
@@ -1250,7 +1292,7 @@ impl Room {
             ended_at,
         };
         if batch.players.is_empty() && batch.answers.is_empty() && ended_at.is_none() {
-            return;
+            return true;
         }
         match self.deps.store.write(batch.clone()).await {
             Ok(()) => {
@@ -1259,12 +1301,14 @@ impl Room {
                         p.dirty = false;
                     }
                 }
+                true
             }
             Err(e) => {
                 tracing::error!(error = %e, game = batch.game_id, "writing the game failed");
                 if let Some(g) = &mut self.game {
                     g.pending = batch.answers;
                 }
+                false
             }
         }
     }

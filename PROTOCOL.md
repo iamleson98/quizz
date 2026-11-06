@@ -43,7 +43,7 @@ numbers; times are unix epoch milliseconds.
 | `[0,"<ticket>"]` | both | **hello**: the first frame, and only the first |
 | `[1,"<quizId>"]` | host | **start**: open a lobby for this quiz (the id from the bank API, a string) |
 | `[2]` | host | **next**: start the first question; close the open question; reveal a closed question at once (skipping the beat); move on from a reveal; leave the podium (ends the game) |
-| `[3]` | host | **end**: end the game now |
+| `[3]` | host | **end**: in the lobby, end the game at once (`[7,0]`); while a game is being played (a question open, the closing beat, a reveal, quest play) stop it and show the **podium**, as the natural end does; from the podium, end the game (`[7,0]`) |
 | `[4,q,mask]` | player | **answer** question number `q` (1-based, as in the question frame) with the options in `mask` |
 
 `mask` is a bit mask of option positions: bit 0 is the first option, bit 1 the
@@ -93,8 +93,9 @@ Details:
   after the beat's own timer is simply the "move on" press). An answer that
   arrives during the beat is refused with `[8,5,4]`. The provisional ranking
   frames to the host continue as long as anything changes, which is only until
-  the close. If the game ends during the beat (the host's `end`, the room
-  closing) the reveal is sent first and the end after it.
+  the close. If the game ends during the beat (the room closing) the reveal is
+  sent first and the end after it; the host's `end` during the beat closes the
+  question, stores its answers and goes to the podium (see **Ending early**).
 - A **reveal** has a personal tail for players (`score, rank, points, right,
   mine, streak, bonus`: total score, rank among the players (0 until ranked),
   points this question **including the streak bonus**, 1 if right else 0, the
@@ -146,6 +147,16 @@ Details:
 - `[3,players]` is sent to the lobby only; `[4,answered,players]` goes to the
   host only. Neither is ever sent per answer: they are refreshed **at most once
   every 500 ms**.
+- **Ending early.** The host's `[3]` during a game (a question open, the
+  closing beat, a reveal) does not end the room: it shows the **podium** at
+  once, exactly as the natural end after the last reveal. An open question is
+  closed first and its answers are stored (no `[11,q]` or reveal is sent for
+  it); the final standings are computed, the results are stored, and the usual
+  podium frames go out (players: the top three and their own tail; the host:
+  the full order). The game then ends (`[7,0]`) when the host sends `[2]` or
+  `[3]` again, or at the idle and room-close timeouts. In the lobby, where
+  nothing has been played, `[3]` ends the game at once. The results are stored
+  once, when the podium opens, whichever way the game goes on from there.
 - Answer keys are never in a question frame: the right options appear only in
   the reveal.
 
@@ -257,7 +268,9 @@ a running service; see the README.
                                            chose option 1, streak 1, bonus 0
 ← [2,...]                                  question 2 ... (right again: +100 bonus)
 ← [6,[["An",2980],["Binh",2960],["Chi",2100]],2960,2]
-← [7,0]                                    the host ended the game
+                                           the podium (after the last reveal, or at once
+                                           when the host pressed end during question 2)
+← [7,0]                                    the host pressed next (or end) at the podium
 ```
 
 And what the host sees of the same round, besides the question and the reveal:
@@ -297,7 +310,7 @@ one-element form `[1,"quizId"]` stays valid and means the same); `1` is quest.
 | lobby | everybody gets `[20,...]`; players may choose a character; the host sees who is there |
 | running | the host's `[2]` starts the clock; every player gets their first question at once |
 | podium | at the end of the time, `[6,...]` (coins are the score); answers are refused |
-| ended | the host's `[2]` (or `[3]` at any time, or the room closing) ends it: `[7,reason]`, results stored |
+| ended | from the podium, the host's `[2]` or `[3]` (or the room closing, or an hour without a command) ends it: `[7,reason]`. In the lobby `[3]` ends it at once. While running, `[3]` stops the clock and shows the podium first |
 
 A second `[2]` while the game is running is refused `[8,5,2]`.
 
@@ -317,7 +330,7 @@ Refused with `[8,code,request]` (`request` is the frame's first number):
 | an answer or pick for a serial that is not the current one | 5 |
 | a second answer (the first locks), an answer after the time, an answer while a chest is waiting or a pause runs | 5 |
 | an invalid choice of options (no bit, a bit beyond the options, several bits for a single question); the question stays open | 4 |
-| an answer sooner than 800 ms after its question was served (nobody reads, thinks and taps that fast): refused, and the question stays open | 5 |
+| an answer sooner than 800 ms after its question was served (nobody reads, thinks and taps that fast): refused `[8,5,6]` and the question stays open. This is the same code as a late answer; a client tells the two apart by whether the question is still open (its own clock, or the question being asked for again with `[8]`) | 5 |
 | an answer or pick the socket received after the game's time was up (even a few ms) | 5 |
 | a pick without a chest waiting, or of a chest already opened | 5 |
 | a chest number above 2 | 4 |
@@ -395,8 +408,10 @@ Details:
   the lobby and when somebody changes character; everything after a hello).
   Players are never sent names other than in the standings and the podium.
 - **Podium (6)**: the race frame with coins as the score: the top three, your own
-  coins and rank; the host gets the full order. Then `[2]` (or `[3]`) from the host
-  ends it: `[7,0]`. The service closing, the room closing and an hour without a
+  coins and rank; the host gets the full order. The host's `[3]` while the game is
+  running shows it at once (the time is up for everyone, as at the natural end;
+  answers after that are refused `[8,5,6]`). Then `[2]` (or `[3]` again) from the
+  host ends it: `[7,0]`. The service closing, the room closing and an hour without a
   command give `[7,3]`, `[7,1]` and `[7,2]` as in the race.
 
 ## The rules (so the client can show them)
@@ -432,8 +447,9 @@ Details:
   told. In friendly mode, or when there is nobody to steal from, a steal that comes
   up is replaced by coins. A player's coins never go below 0.
 - **End.** When the time is up (the `endsAt` of frame 22, on the server's clock)
-  the podium; the host ends the game. Results are stored once, at the end, for the
-  bank's results list (`mode: "quest"`, per player coins, answered, correct, best
+  the podium; the host ends the game. The host's `[3]` while it runs brings the
+  podium forward. Results are stored once, when the podium opens (however the game
+  then ends), for the bank's results list (`mode: "quest"`, per player coins, answered, correct, best
   streak). Nothing about a student is kept beyond that, and it expires like any
   game's results (90 days).
 

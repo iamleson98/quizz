@@ -400,6 +400,7 @@ async fn a_reconnect_resumes_the_game_and_extends_the_same_span() {
         "the first answer locked"
     );
     send(&mut host, json!([3])).await;
+    send(&mut host, json!([3])).await; // the podium first, then the end
     recv_kind(&mut again, 7).await;
 
     let pusher = Pusher::new(&s.state).unwrap();
@@ -992,6 +993,7 @@ async fn a_quest_game_over_real_sockets_from_start_to_stored_results() {
     assert_eq!(recv(&mut b).await, json!([8, 4, 6]));
 
     send(&mut host, json!([3])).await;
+    send(&mut host, json!([3])).await; // the podium first, then the end
     assert_eq!(recv_kind(&mut a, 7).await, json!([7, 0]));
 
     // the results are in the bank, as a quest
