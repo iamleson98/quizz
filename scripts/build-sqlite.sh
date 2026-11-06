@@ -5,7 +5,14 @@
 #
 # Requirements: cc, make, git, tclsh (8.5+; needed to generate the amalgamation).
 #
+# Cross-compiling: the amalgamation is generated with the build machine's own tools, and only the
+# final compile and archive use CC and AR, so a cross toolchain builds a library for another
+# machine (CC=x86_64-linux-gnu-gcc AR=x86_64-linux-gnu-ar ./scripts/build-sqlite.sh). The service
+# is then built for the same target; see "Cross-compiling" in the README.
+#
 # Environment overrides:
+#   CC               C compiler for the library (default: cc), a command name without arguments
+#   AR               archiver for the library (default: ar)
 #   SQLITE_GIT_REF   git ref to build (default: the pinned begin-concurrent commit)
 #   SQLITE_REPO      repository URL (default: https://github.com/sqlite/sqlite)
 #   SQLITE_OUT       output directory (default: third_party/sqlite-build)
@@ -19,11 +26,15 @@ REF_DEFAULT="71f1e0e7384acdd2f80814a52df5f68cc4b99f33"
 REF="${SQLITE_GIT_REF:-$REF_DEFAULT}"
 OUT="${SQLITE_OUT:-$ROOT/third_party/sqlite-build}"
 SRC="$ROOT/third_party/sqlite"
+CC="${CC:-cc}"
+AR="${AR:-ar}"
 
 echo "==> sqlite source: $REPO @ ${REF}"
 echo "==> output:        $OUT"
 
 command -v cc >/dev/null     || { echo "cc not found" >&2; exit 1; }
+command -v "$CC" >/dev/null  || { echo "$CC not found" >&2; exit 1; }
+command -v "$AR" >/dev/null  || { echo "$AR not found" >&2; exit 1; }
 command -v make >/dev/null   || { echo "make not found" >&2; exit 1; }
 command -v git >/dev/null    || { echo "git not found" >&2; exit 1; }
 if ! command -v tclsh >/dev/null; then
@@ -53,10 +64,12 @@ COMMIT="$(git -C "$SRC" rev-parse HEAD)"
 BUILD="$SRC/.build"
 mkdir -p "$BUILD"
 cd "$BUILD"
+# The generators (lemon, mksourceid, ...) run on this machine: configure and make see no CC or AR,
+# so a cross compiler set for the library below does not reach them.
 if [ ! -f Makefile ]; then
-    ../configure
+    env -u CC -u AR ../configure
 fi
-make sqlite3.c
+env -u CC -u AR make sqlite3.c
 SQLITE3_C="$BUILD/sqlite3.c"
 [ -f "$SQLITE3_C" ] || SQLITE3_C="$SRC/sqlite3.c"
 [ -f "$SQLITE3_C" ] || { echo "amalgamation sqlite3.c not found" >&2; exit 1; }
@@ -106,8 +119,8 @@ CFLAGS_SQLITE=(
 rm -rf "$OUT"
 mkdir -p "$OUT/include" "$OUT/lib/pkgconfig"
 
-cc "${CFLAGS_SQLITE[@]}" -c "$SQLITE3_C" -o "$OUT/lib/sqlite3.o"
-ar rcs "$OUT/lib/libsqlite3.a" "$OUT/lib/sqlite3.o"
+"$CC" "${CFLAGS_SQLITE[@]}" -c "$SQLITE3_C" -o "$OUT/lib/sqlite3.o"
+"$AR" rcs "$OUT/lib/libsqlite3.a" "$OUT/lib/sqlite3.o"
 rm -f "$OUT/lib/sqlite3.o"
 
 cp "$HDR" "$EXT_H" "$OUT/include/"
@@ -129,7 +142,7 @@ source:     ${REPO} (branch: begin-concurrent)
 commit:     ${COMMIT}
 version:    ${VERSION}
 built:      $(date -u +%Y-%m-%dT%H:%M:%SZ)
-builder:    $(cc --version | head -1)
+builder:    $("$CC" --version | head -1)
 
 configure:  ./configure && make sqlite3.c   (sqlite autosetup; requires tclsh)
 

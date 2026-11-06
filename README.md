@@ -101,6 +101,25 @@ the LMS server beside it.
 The Docker image builds SQLite itself (`docker compose up --build`, with the keys
 in the environment).
 
+### Cross-compiling
+
+To build for another machine (an amd64 image on an arm64 laptop), build SQLite with the target's
+compiler and the service for the target; nothing runs under emulation, and build scripts and
+proc macros keep running on the build machine:
+
+```bash
+rustup target add x86_64-unknown-linux-gnu        # gcc-x86-64-linux-gnu and libc6-dev-amd64-cross on Debian
+CC=x86_64-linux-gnu-gcc AR=x86_64-linux-gnu-ar ./scripts/build-sqlite.sh
+CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
+PKG_CONFIG_ALLOW_CROSS=1 cargo build --release
+```
+
+The binary is then in `target/x86_64-unknown-linux-gnu/release/`. The production Dockerfile
+(`deploy/images/quiz.Dockerfile` in the LMS repository) does exactly this when the platform it
+builds for differs from the one it builds on.
+
 ## Try it with a ticket
 
 `mint-ticket` is a development tool: it signs a ticket with `QUIZ_TICKET_KEY`
