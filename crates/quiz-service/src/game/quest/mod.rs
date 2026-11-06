@@ -35,6 +35,8 @@ use tokio::time::Instant;
 
 /// The pause after a wrong or missed answer, enforced by the server.
 pub const PAUSE_MS: u64 = 2500;
+/// The soonest an answer is accepted after its question was served.
+pub const MIN_THINK_MS: u64 = 800;
 /// Characters a player can choose from.
 pub const CHARACTERS: u32 = 12;
 /// The standings strip of a player is refreshed at most this often.
@@ -53,7 +55,13 @@ enum PState {
     /// Before the game runs, or between a chest and the next question.
     Idle,
     /// A question is open until `deadline`.
-    Asking { q: usize, deadline: Instant },
+    Asking {
+        q: usize,
+        deadline: Instant,
+        /// When it was served: an answer sooner than [`MIN_THINK_MS`] after is
+        /// refused.
+        served: Instant,
+    },
     /// The three hidden chests of a right answer.
     Chest([Outcome; 3]),
     /// Thinking about a wrong answer until the instant.
@@ -311,7 +319,11 @@ impl Quest {
         p.serial += 1;
         let limit = Duration::from_secs(self.questions[q].question.time_limit_sec as u64);
         let deadline = now + limit;
-        p.state = PState::Asking { q, deadline };
+        p.state = PState::Asking {
+            q,
+            deadline,
+            served: now,
+        };
         self.timers.push(Reverse((deadline, pid, p.serial)));
         fx.to_player.push((
             pid,
@@ -364,9 +376,19 @@ impl Quest {
             return Err(AppError::Conflict("the game is not running".into()));
         }
         self.expire(pid, now, fx);
-        let PState::Asking { q, deadline } = self.players[pid].state else {
+        let PState::Asking {
+            q,
+            deadline,
+            served,
+        } = self.players[pid].state
+        else {
             return Err(AppError::Conflict("there is no open question".into()));
         };
+        // the clock ran out while the frame was on its way, or the last
+        // second of the game is gone: too late, whatever the phase says
+        if self.running().is_some_and(|ends_at| now >= ends_at) {
+            return Err(AppError::Conflict("the time is up".into()));
+        }
         if serial != self.players[pid].serial {
             return Err(AppError::Conflict(
                 "that is not the current question".into(),
@@ -385,6 +407,12 @@ impl Quest {
             .filter(|(i, _)| mask & (1 << i) != 0)
             .map(|(_, o)| o.id)
             .collect();
+        // nobody reads, thinks and taps in under 800 ms: that is a script
+        if now < served + Duration::from_millis(MIN_THINK_MS) {
+            return Err(AppError::Conflict(
+                "answered before anybody could have read the question".into(),
+            ));
+        }
         // exactly the right set; partial credit does not apply here
         let right = grade_question(&question, &chosen).correct;
         self.answers += 1;
@@ -444,6 +472,9 @@ impl Quest {
     ) -> AppResult<()> {
         if self.running().is_none() {
             return Err(AppError::Conflict("the game is not running".into()));
+        }
+        if self.running().is_some_and(|ends_at| now >= ends_at) {
+            return Err(AppError::Conflict("the time is up".into()));
         }
         let PState::Chest(outcomes) = self.players[pid].state else {
             return Err(AppError::Conflict("there is no chest to pick".into()));
@@ -539,7 +570,7 @@ impl Quest {
         }
         self.expire(pid, now, fx);
         match self.players[pid].state {
-            PState::Asking { q, deadline } => {
+            PState::Asking { q, deadline, .. } => {
                 let remaining = deadline.saturating_duration_since(now).as_millis() as i64;
                 fx.to_player.push((
                     pid,
@@ -565,7 +596,7 @@ impl Quest {
     /// A question whose time is over counts as missed, whenever somebody
     /// notices.
     fn expire(&mut self, pid: usize, now: Instant, fx: &mut Fx) {
-        if let PState::Asking { q, deadline } = self.players[pid].state
+        if let PState::Asking { q, deadline, .. } = self.players[pid].state
             && now >= deadline
         {
             self.players[pid].streak = 0;
@@ -758,7 +789,7 @@ impl Quest {
                 fx.to_player
                     .push((pid, Out::Plain(frames::running(wall, wall + left))));
                 fx.to_player.push((pid, Out::Plain(self.me(pid, now))));
-                if let PState::Asking { q, deadline } = self.players[pid].state {
+                if let PState::Asking { q, deadline, .. } = self.players[pid].state {
                     fx.to_player.push((
                         pid,
                         Out::Open(

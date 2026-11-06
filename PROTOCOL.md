@@ -317,6 +317,8 @@ Refused with `[8,code,request]` (`request` is the frame's first number):
 | an answer or pick for a serial that is not the current one | 5 |
 | a second answer (the first locks), an answer after the time, an answer while a chest is waiting or a pause runs | 5 |
 | an invalid choice of options (no bit, a bit beyond the options, several bits for a single question); the question stays open | 4 |
+| an answer sooner than 800 ms after its question was served (nobody reads, thinks and taps that fast): refused, and the question stays open | 5 |
+| an answer or pick the socket received after the game's time was up (even a few ms) | 5 |
 | a pick without a chest waiting, or of a chest already opened | 5 |
 | a chest number above 2 | 4 |
 | `[8]` during the pause, or while a chest is waiting | 5 |

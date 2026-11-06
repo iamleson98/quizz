@@ -1,7 +1,7 @@
 //! Quest mode: paused time, a fake store and a scripted random source.
 
 use super::chest::{Draw, Outcome, SeededDraw, roll_for};
-use super::{ALLOWED_SECONDS, PAUSE_MS, STANDINGS_EVERY};
+use super::{ALLOWED_SECONDS, MIN_THINK_MS, PAUSE_MS, STANDINGS_EVERY};
 use crate::auth::Role;
 use crate::game::frames::ClientFrame;
 use crate::game::store::LoadedQuiz;
@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// Questions 20 to 23: single (right: first option), multiple choice (first
 /// and third), true/false (second), single (fourth). Limits 20, 20, 10, 30 s.
@@ -165,7 +166,10 @@ fn served(frames: &[Value]) -> Option<Served> {
     })
 }
 
+/// Think for a moment (an answer sooner than 800 ms after its question is
+/// refused), then answer.
 async fn reply(c: &Client, s: &Served, mask: u32) {
+    adv(Duration::from_millis(MIN_THINK_MS + 50)).await;
     c.send(ClientFrame::QuestAnswer {
         serial: s.serial,
         mask,
@@ -449,7 +453,7 @@ async fn a_wrong_answer_shows_the_key_and_costs_a_pause_the_server_enforces() {
     adv(Duration::from_millis(PAUSE_MS - 200)).await;
     p.send(ClientFrame::QuestNext).await;
     settle().await;
-    let f = p.frames();
+    let f: Vec<Value> = p.frames().into_iter().filter(|f| kind(f) != 28).collect();
     assert_eq!(f, vec![json!([8, 5, 8])], "still thinking");
     // then the next question arrives by itself
     adv(Duration::from_millis(400)).await;
@@ -1011,9 +1015,16 @@ async fn the_host_board_and_the_players_strip_are_throttled_and_only_when_change
     }
     // four answers within 100 ms: the board goes out at once and then once
     // more after 500 ms
+    adv(Duration::from_millis(MIN_THINK_MS)).await; // nobody answers sooner
+    h.frames();
     for (i, s) in cur.iter().enumerate() {
         q.chests(1, [Outcome::Coins(20); 3]);
-        reply(&ps[i], s, right_mask(s.id)).await;
+        ps[i]
+            .send(ClientFrame::QuestAnswer {
+                serial: s.serial,
+                mask: right_mask(s.id),
+            })
+            .await;
         settle().await;
         adv(Duration::from_millis(20)).await;
     }
@@ -1040,9 +1051,6 @@ async fn the_host_board_and_the_players_strip_are_throttled_and_only_when_change
 
     // the standings strip: at most every 3 s, and the shared part is the same
     // bytes for everyone
-    for p in &mut ps {
-        p.frames();
-    }
     adv(STANDINGS_EVERY).await;
     let strips: Vec<Value> = ps
         .iter_mut()
@@ -1133,12 +1141,14 @@ async fn at_the_end_the_podium_is_shown_and_the_results_are_stored_in_one_write(
             .await;
         settle().await;
         now_cur[0] = served(&ps[0].frames()).unwrap();
+        h.frames();
     }
     q.chests(1, [Outcome::Coins(20); 3]);
     reply(&ps[1], &cur[1], right_mask(cur[1].id)).await;
     reply(&ps[2], &cur[2], wrong_mask(cur[2].id)).await;
     settle().await;
     ps[1].frames();
+    h.frames();
 
     assert!(
         q.w.store.batches.lock().unwrap().is_empty(),
@@ -1280,4 +1290,99 @@ async fn the_spans_heartbeat_also_runs_while_a_quest_waits_in_the_lobby_and_on_t
     }
     assert!(beats("teacher") >= before + 3, "the podium too");
     drop(p);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_sooner_than_800_ms_after_the_question_is_refused_and_the_question_stays_open() {
+    let q = Quest::new();
+    let (_h, mut ps, cur) = running(&q, 1, 0).await;
+    let p = &mut ps[0];
+    let s = cur[0].clone();
+    let send = |mask: u32| ClientFrame::QuestAnswer {
+        serial: s.serial,
+        mask,
+    };
+    // 1 ms after it was served: a script, not a student
+    p.send(send(right_mask(s.id))).await;
+    settle().await;
+    assert_eq!(p.frames(), vec![json!([8, 5, 6])]);
+    adv(Duration::from_millis(MIN_THINK_MS - 100)).await;
+    p.send(send(right_mask(s.id))).await;
+    settle().await;
+    assert_eq!(
+        p.frames(),
+        vec![json!([8, 5, 6])],
+        "799 ms is still too soon"
+    );
+
+    // refused, not spent: a little later the same question takes the answer
+    q.chests(1, [Outcome::Coins(20); 3]);
+    adv(Duration::from_millis(200)).await;
+    p.send(send(right_mask(s.id))).await;
+    settle().await;
+    let v = verdict(&p.frames()).expect("accepted once 800 ms have passed");
+    assert_eq!(v[2], json!(1));
+    // refusals did not count as answers
+    let board = q.w.store.batches.lock().unwrap().len();
+    assert_eq!(board, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_received_after_the_end_of_the_game_is_refused_even_before_the_clock_fires() {
+    use super::{Fx, Quest as Game};
+    let now = Instant::now();
+    let mut game = Game::new(
+        1,
+        "t".into(),
+        "teacher".into(),
+        quest_quiz().questions,
+        300,
+        false,
+        Box::new(SeededDraw(3)),
+        now + Duration::from_secs(7200),
+        now,
+    );
+    let pid = game.join("p1", "P1", 0).unwrap();
+    let mut fx = Fx::default();
+    game.begin(now, 0, &mut fx);
+    let ends_at = now + Duration::from_secs(300);
+    // a question served five seconds before the end still has its own time
+    // left when the game's time is up
+    game.serve(pid, ends_at - Duration::from_secs(5), &mut fx);
+    let serial = game.players[pid].serial;
+    let id = match game.players[pid].state {
+        super::PState::Asking { q, deadline, .. } => {
+            assert!(
+                deadline > ends_at + Duration::from_secs(4),
+                "the question outlives the game"
+            );
+            game.questions[q].question.id
+        }
+        _ => panic!("a question is open"),
+    };
+    let right = right_mask(id);
+    // 1 ms after the end: refused although the phase is still Running
+    let refused = game.answer(
+        pid,
+        serial,
+        right,
+        ends_at + Duration::from_millis(1),
+        &mut fx,
+    );
+    assert!(
+        matches!(refused, Err(crate::error::AppError::Conflict(_))),
+        "{refused:?}"
+    );
+    assert_eq!(game.answers, 0, "it was not counted");
+    // a second before the end it is taken
+    assert!(
+        game.answer(
+            pid,
+            serial,
+            right,
+            ends_at - Duration::from_secs(1),
+            &mut fx
+        )
+        .is_ok()
+    );
 }

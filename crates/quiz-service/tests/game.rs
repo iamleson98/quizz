@@ -969,6 +969,8 @@ async fn a_quest_game_over_real_sockets_from_start_to_stored_results() {
         other => panic!("unexpected question {other}"),
     };
     assert!(kind <= 2);
+    // nobody answers in under 800 ms
+    tokio::time::sleep(Duration::from_millis(900)).await;
     send(&mut a, json!([6, serial, mask])).await;
     let verdict = recv_kind(&mut a, 25).await;
     assert_eq!(verdict[2], 1, "right");
