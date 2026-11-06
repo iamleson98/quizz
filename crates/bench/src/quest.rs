@@ -192,7 +192,7 @@ pub async fn run(args: Args, key: Secret) -> anyhow::Result<()> {
         })
         .collect();
     let mut tasks = Vec::new();
-    for wave in (0..n).collect::<Vec<_>>().chunks(100) {
+    for wave in (0..n).collect::<Vec<_>>().chunks(50) {
         let mut pending = Vec::new();
         for &i in wave {
             let token = mint(

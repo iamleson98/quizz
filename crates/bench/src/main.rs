@@ -445,10 +445,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         players: (0..n).map(make).collect(),
     });
 
-    // Everyone connects (in waves, so the listen queue is not the test).
+    // Everyone connects (in waves of 50: the service admits 64 sockets that have not said hello per client address, and the bench is one address).
     let connect_started = Instant::now();
     let mut tasks = Vec::new();
-    for wave in (0..n).collect::<Vec<_>>().chunks(100) {
+    for wave in (0..n).collect::<Vec<_>>().chunks(50) {
         let mut pending = Vec::new();
         for &i in wave {
             let token = mint(
