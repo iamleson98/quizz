@@ -81,6 +81,7 @@ async fn play_game(state: &AppState, quiz: &Value, host: &str) -> i64 {
         correct: true,
         credit: 1.0,
         points,
+        bonus: 0,
         time_ms: 4000,
     };
     store

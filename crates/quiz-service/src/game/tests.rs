@@ -175,6 +175,11 @@ fn kind(frame: &Value) -> u64 {
     frame[0].as_u64().unwrap()
 }
 
+/// A progress frame without its ranking: `[4, answered, players, counts]`.
+fn head4(f: &Value) -> Value {
+    Value::Array(f.as_array().unwrap()[..4].to_vec())
+}
+
 fn last_of(frames: &[Value], k: u64) -> Option<&Value> {
     frames.iter().rev().find(|f| kind(f) == k)
 }
@@ -246,16 +251,33 @@ async fn a_whole_game_scores_ranks_and_ends() {
     assert_eq!(reveal[1], json!(1));
     assert_eq!(reveal[2], json!(0b0010), "correct options");
     assert_eq!(reveal[3], json!([1, 1, 0, 0]), "how many chose each option");
-    // [5, q, mask, counts, explanation, top, score, rank, points, right, mine]
+    // [5, q, mask, counts, explanation, top, score, rank, points, right, mine, streak, bonus]
     assert_eq!(
         &reveal.as_array().unwrap()[6..],
-        &[json!(875), json!(1), json!(875), json!(1), json!(2)]
+        &[
+            json!(875),
+            json!(1),
+            json!(875),
+            json!(1),
+            json!(2),
+            json!(1),
+            json!(0)
+        ],
+        "the first right answer has a streak of 1 and no bonus"
     );
     let f2 = p2.frames();
     let reveal2 = last_of(&f2, 5).unwrap();
     assert_eq!(
         &reveal2.as_array().unwrap()[6..],
-        &[json!(0), json!(2), json!(0), json!(0), json!(1)]
+        &[
+            json!(0),
+            json!(2),
+            json!(0),
+            json!(0),
+            json!(1),
+            json!(0),
+            json!(0)
+        ]
     );
     let fh = h.frames();
     assert_eq!(
@@ -513,6 +535,7 @@ async fn the_hosts_count_is_refreshed_at_most_every_500_ms() {
     h.send(ClientFrame::Start(1)).await;
     h.send(ClientFrame::Next).await;
     settle().await;
+    adv(Duration::from_millis(600)).await; // the joins' names went out; the 500 ms are over
     h.frames();
     // ten answers within 100 ms (the last player never answers)
     for p in ps.iter().take(9) {
@@ -526,8 +549,13 @@ async fn the_hosts_count_is_refreshed_at_most_every_500_ms() {
         .frames()
         .into_iter()
         .filter(|f| kind(f) == 4)
+        .map(|f| head4(&f))
         .collect::<Vec<_>>();
-    assert_eq!(later, vec![json!([4, 9, 10])], "then the latest count");
+    assert_eq!(
+        later,
+        vec![json!([4, 9, 10, [0, 9, 0, 0]])],
+        "then the latest count, with the selections"
+    );
     for p in &mut ps {
         let f = p.frames();
         assert!(
@@ -726,4 +754,482 @@ async fn not_answering_never_beats_a_wrong_answer_in_the_tie_break() {
     let f = silent.frames();
     assert_eq!(last_of(&f, 5).unwrap()[7], json!(2));
     h.frames();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_host_sees_how_many_chose_each_option_live_and_players_do_not() {
+    let w = world();
+    let mut ps = Vec::new();
+    for n in 0..4 {
+        ps.push(player(&w, n).await);
+    }
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await; // question 1
+    settle().await;
+    h.send(ClientFrame::Next).await; // the host closes it
+    h.send(ClientFrame::Next).await; // question 2, multiple choice
+    adv(Duration::from_millis(600)).await;
+    h.frames();
+    for p in &mut ps {
+        p.frames();
+    }
+
+    // a multiple-choice answer counts toward every option it chose
+    answer(&ps[0], 2, 0b0101).await;
+    settle().await;
+    let f = h.frames();
+    assert_eq!(
+        f.iter()
+            .filter(|f| kind(f) == 4)
+            .map(head4)
+            .collect::<Vec<_>>(),
+        vec![json!([4, 1, 4, [1, 0, 1, 0]])],
+        "the first change goes out at once"
+    );
+    answer(&ps[1], 2, 0b0001).await;
+    answer(&ps[2], 2, 0b0100).await;
+    settle().await;
+    assert!(
+        h.frames().iter().all(|f| kind(f) != 4),
+        "held back for 500 ms"
+    );
+    adv(Duration::from_millis(500)).await;
+    let f = h.frames();
+    assert_eq!(
+        f.iter()
+            .filter(|f| kind(f) == 4)
+            .map(head4)
+            .collect::<Vec<_>>(),
+        vec![json!([4, 3, 4, [2, 0, 2, 0]])]
+    );
+
+    // nothing changed, nothing sent; a refused answer changes nothing
+    answer(&ps[0], 2, 0b0010).await;
+    adv(Duration::from_secs(3)).await;
+    assert!(
+        h.frames().iter().all(|f| kind(f) != 4),
+        "no change, no frame"
+    );
+
+    for p in &mut ps {
+        let f = p.frames();
+        assert!(
+            f.iter().all(|f| kind(f) != 4 && kind(f) != 10),
+            "players never get counts or names: {f:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_host_is_told_who_joined_incrementally_and_players_never_are() {
+    let w = world();
+    let mut h = host(&w).await;
+    assert!(
+        h.frames().iter().all(|f| kind(f) != 10),
+        "no lobby, no names frame"
+    );
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    adv(Duration::from_millis(600)).await;
+    h.frames();
+
+    let mut p1 = player(&w, 1).await;
+    let p2 = player(&w, 2).await;
+    let mut p3 = player(&w, 3).await;
+    let f = h.frames();
+    assert_eq!(
+        f.iter().filter(|f| kind(f) == 10).collect::<Vec<_>>(),
+        vec![&json!([10, ["name-p1"]])],
+        "the first joiner is reported at once"
+    );
+    adv(Duration::from_millis(500)).await;
+    let f = h.frames();
+    assert_eq!(
+        f.iter().filter(|f| kind(f) == 10).collect::<Vec<_>>(),
+        vec![&json!([10, ["name-p2", "name-p3"]])],
+        "the others, in one frame, at most every 500 ms"
+    );
+
+    // leavers are not reported; the count stays authoritative
+    p2.room.detach(p2.sock).await;
+    adv(Duration::from_secs(2)).await;
+    let f = h.frames();
+    assert!(f.iter().all(|f| kind(f) != 10));
+    assert_eq!(last_of(&f, 3).unwrap(), &json!([3, 2]));
+
+    // a late joiner in the middle of a game is reported too
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    let _p4 = player(&w, 4).await;
+    adv(Duration::from_millis(600)).await;
+    let f = h.frames();
+    assert_eq!(
+        f.iter().filter(|f| kind(f) == 10).collect::<Vec<_>>(),
+        vec![&json!([10, ["name-p4"]])]
+    );
+
+    // a host that says hello again gets the whole list, once
+    let mut again = connect(&w, "s1", "teacher", Role::Host).await;
+    let f = again.frames();
+    assert_eq!(kind(&f[0]), 2, "the state frame comes first");
+    let all: Vec<_> = f.iter().filter(|f| kind(f) == 10).collect();
+    assert_eq!(all, vec![&json!([10, ["name-p1", "name-p3", "name-p4"]])]);
+    assert!(
+        f.iter().any(|f| kind(f) == 4),
+        "and the selections of the open question"
+    );
+
+    for p in [&mut p1, &mut p3] {
+        let f = p.frames();
+        assert!(f.iter().all(|f| kind(f) != 10 && kind(f) != 4), "{f:?}");
+    }
+}
+
+/// `(points, right, streak, bonus)` from a player's reveal tail.
+fn result_of(frames: &[Value]) -> (i64, i64, i64, i64) {
+    let r = last_of(frames, 5)
+        .expect("a reveal")
+        .as_array()
+        .unwrap()
+        .clone();
+    (
+        r[8].as_i64().unwrap(),
+        r[9].as_i64().unwrap(),
+        r[11].as_i64().unwrap(),
+        r[12].as_i64().unwrap(),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn streaks_grow_and_reset_on_partial_wrong_or_missing_and_late_joiners_start_at_zero() {
+    let w = world();
+    let mut a = player(&w, 1).await; // always fully right
+    let mut b = player(&w, 2).await; // right, partly right, right
+    let mut c = player(&w, 3).await; // right, silent, right
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+
+    // question 1: everybody right; a streak of one earns no bonus
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    for p in [&a, &b, &c] {
+        answer(p, 1, 0b0010).await;
+    }
+    settle().await;
+    for p in [&mut a, &mut b, &mut c] {
+        let (points, right, streak, bonus) = result_of(&p.frames());
+        assert_eq!((right, streak, bonus), (1, 1, 0));
+        assert!((990..=1000).contains(&points));
+    }
+
+    // question 2 (multiple choice): a fully right; b partly; c silent
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    let mut late = player(&w, 9).await; // joins in the middle of the game
+    answer(&a, 2, 0b0101).await;
+    answer(&b, 2, 0b0001).await;
+    settle().await;
+    h.send(ClientFrame::Next).await; // the host closes it; c never answered
+    settle().await;
+    let (points, right, streak, bonus) = result_of(&a.frames());
+    assert_eq!(
+        (right, streak, bonus),
+        (1, 2, 100),
+        "the second in a row earns 100"
+    );
+    assert!(
+        (1090..=1100).contains(&points),
+        "the bonus is part of the points: {points}"
+    );
+    let (points, right, streak, bonus) = result_of(&b.frames());
+    assert_eq!(
+        (right, streak, bonus),
+        (0, 0, 0),
+        "partial credit ends the streak"
+    );
+    assert!(points > 0 && points < 600);
+    assert_eq!(
+        result_of(&c.frames()),
+        (0, 0, 0, 0),
+        "a missed question ends it too"
+    );
+    assert_eq!(
+        result_of(&late.frames()),
+        (0, 0, 0, 0),
+        "a late joiner starts at zero"
+    );
+
+    // question 3: a is on 3 in a row, the rest start over; the late joiner
+    // plays it as their first
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    for p in [&a, &b, &c, &late] {
+        answer(p, 3, 0b10).await;
+    }
+    settle().await;
+    let (_, _, streak, bonus) = result_of(&a.frames());
+    assert_eq!((streak, bonus), (3, 200));
+    for p in [&mut b, &mut c, &mut late] {
+        let (_, right, streak, bonus) = result_of(&p.frames());
+        assert_eq!((right, streak, bonus), (1, 1, 0));
+    }
+
+    // the stored answers carry the bonus apart from the points
+    h.send(ClientFrame::End).await;
+    settle().await;
+    let batches = w.store.batches.lock().unwrap();
+    let answers: Vec<_> = batches.iter().flat_map(|b| b.answers.iter()).collect();
+    assert_eq!(answers.iter().filter(|a| a.bonus == 200).count(), 1);
+    assert_eq!(answers.iter().filter(|a| a.bonus == 100).count(), 1);
+    assert!(
+        answers
+            .iter()
+            .filter(|a| a.bonus > 0)
+            .all(|a| a.points >= a.bonus + 990)
+    );
+    h.frames();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_streak_survives_a_reconnect() {
+    let w = world();
+    let mut p = player(&w, 1).await;
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&p, 1, 0b0010).await;
+    settle().await;
+    p.frames();
+    p.room.detach(p.sock).await;
+    settle().await;
+    let mut again = player(&w, 1).await;
+    again.frames();
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&again, 2, 0b0101).await;
+    settle().await;
+    let (_, right, streak, bonus) = result_of(&again.frames());
+    assert_eq!(
+        (right, streak, bonus),
+        (1, 2, 100),
+        "the second question in a row, across the reconnect"
+    );
+    h.frames();
+}
+
+/// The last progress frame in `frames`.
+fn last_progress(frames: &[Value]) -> Value {
+    last_of(frames, 4).expect("a progress frame").clone()
+}
+
+/// A provisional row as `(name, total)`.
+fn rows_of(progress: &Value) -> Vec<(String, i64)> {
+    progress[4]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap()))
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_host_sees_a_provisional_ranking_that_the_close_makes_final() {
+    let w = world();
+    let mut ps = Vec::new();
+    for n in 1..=4 {
+        ps.push(player(&w, n).await);
+    }
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    h.send(ClientFrame::Next).await; // question 1
+    settle().await;
+    adv(Duration::from_millis(600)).await;
+    h.frames();
+    for p in &mut ps {
+        p.frames();
+    }
+
+    // p2 answers first (right), p1 four seconds later (right), p3 in the same
+    // instant as p1 (right), p4 is wrong. Every answer is spaced past the
+    // throttle so each one is seen.
+    let mut seen_after_answer = Vec::new();
+    let mut last_frames = Vec::new();
+    for (i, mask) in [(1usize, 0b0010u32), (0, 0b0010), (3, 0b0001)] {
+        adv(Duration::from_secs(if i == 0 { 4 } else { 1 })).await;
+        answer(&ps[i], 1, mask).await;
+        if i == 0 {
+            answer(&ps[2], 1, 0b0010).await; // the same instant as p1
+        }
+        settle().await;
+        adv(Duration::from_millis(600)).await;
+        let f = h.frames();
+        seen_after_answer.push((i, rows_of(&last_progress(&f))));
+        last_frames = f;
+    }
+    let after_p2 = &seen_after_answer[0].1;
+    assert_eq!(after_p2[0].0, "name-p2", "the first right answer leads");
+    assert!(after_p2[0].1 > 900, "{after_p2:?}");
+    let after_p1_p3 = &seen_after_answer[1].1;
+    let names: Vec<&str> = after_p1_p3.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        names,
+        ["name-p2", "name-p1", "name-p3", "name-p4"],
+        "faster first; the same points and time, whoever joined first; nobody twice"
+    );
+    assert_eq!(
+        after_p1_p3[1].1, after_p1_p3[2].1,
+        "p1 and p3 are tied on points"
+    );
+    assert_eq!(after_p1_p3[3].1, 0, "a wrong answer earns nothing");
+
+    // the last answer closed the question: the reveal's scoreboard is what
+    // was shown
+    let shown = after_p1_p3.clone();
+    let last_before_close = seen_after_answer[2].1.clone();
+    assert_eq!(last_before_close, shown, "a wrong answer moves nobody");
+    let reveal = last_of(&last_frames, 5).expect("the reveal");
+    let final_rows: Vec<(String, i64)> = reveal[5]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap()))
+        .collect();
+    assert_eq!(final_rows, shown, "provisional == final");
+    for p in &mut ps {
+        let f = p.frames();
+        assert!(
+            f.iter().all(|f| kind(f) != 4),
+            "players never see the ranking: {f:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_provisional_ranking_counts_the_streak_and_partial_credit_like_the_close() {
+    let w = world();
+    let mut a = player(&w, 1).await;
+    let mut b = player(&w, 2).await;
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&a, 1, 0b0010).await;
+    answer(&b, 1, 0b0010).await; // both right: the question closes
+    settle().await;
+    h.send(ClientFrame::Next).await; // question 2, multiple choice
+    settle().await;
+    adv(Duration::from_secs(2)).await;
+    adv(Duration::from_millis(600)).await; // a flush left over from question 1 is done
+    for c in [&mut a, &mut b] {
+        c.frames();
+    }
+    h.frames();
+
+    answer(&a, 2, 0b0101).await; // fully right, second in a row: +100
+    settle().await;
+    let top = rows_of(&last_progress(&h.frames()));
+    assert_eq!(top[0].0, "name-p1");
+    let first_total = top.iter().find(|r| r.0 == "name-p1").unwrap().1;
+    let before = top.iter().find(|r| r.0 == "name-p2").unwrap().1;
+    assert!(
+        first_total - before > 1000,
+        "a speed score is under 1000: the rest is the streak bonus: {top:?}"
+    );
+
+    adv(Duration::from_millis(600)).await;
+    answer(&b, 2, 0b0001).await; // half of the right options: half credit, no streak
+    settle().await;
+    let top = rows_of(&last_progress(&h.frames()));
+    let b_total = top.iter().find(|r| r.0 == "name-p2").unwrap().1;
+    assert!(b_total > before + 400 && b_total < before + 600, "{top:?}");
+
+    // the close uses exactly these figures
+    settle().await;
+    let f = a.frames();
+    let reveal = last_of(&f, 5).unwrap();
+    assert_eq!(reveal[6].as_i64().unwrap(), first_total, "a's total");
+    let first_points = reveal[8].as_i64().unwrap();
+    let f = b.frames();
+    let reveal = last_of(&f, 5).unwrap();
+    assert_eq!(reveal[6].as_i64().unwrap(), b_total, "b's total");
+    let b_points = reveal[8].as_i64().unwrap();
+    let batches = w.store.batches.lock().unwrap();
+    let stored: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| b.answers.iter())
+        .filter(|a| a.question_id == 11)
+        .map(|a| a.points)
+        .collect();
+    assert_eq!(stored.len(), 2);
+    assert!(stored.contains(&first_points) && stored.contains(&b_points));
+    h.frames();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_provisional_ranking_is_throttled_and_only_sent_when_something_changed() {
+    let w = world();
+    let mut ps = Vec::new();
+    for n in 1..=6 {
+        ps.push(player(&w, n).await);
+    }
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    adv(Duration::from_millis(600)).await;
+    h.frames();
+    for p in ps.iter().take(5) {
+        answer(p, 1, 0b0010).await;
+        adv(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        h.frames().iter().filter(|f| kind(f) == 4).count(),
+        1,
+        "one at once, the rest wait"
+    );
+    adv(Duration::from_millis(500)).await;
+    let f = h.frames();
+    let last = last_progress(&f);
+    assert_eq!(
+        f.iter().filter(|f| kind(f) == 4).count(),
+        1,
+        "then one more"
+    );
+    assert_eq!(
+        rows_of(&last).len(),
+        6,
+        "a ranking of everyone, at most ten"
+    );
+    adv(Duration::from_secs(5)).await;
+    assert!(
+        h.frames().iter().all(|f| kind(f) != 4),
+        "nothing changed, nothing sent"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_ranking_is_the_top_ten_only() {
+    let w = world();
+    let mut ps = Vec::new();
+    for n in 1..=12 {
+        ps.push(player(&w, n).await);
+    }
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    adv(Duration::from_millis(600)).await;
+    h.frames();
+    answer(&ps[0], 1, 0b0010).await;
+    settle().await;
+    let f = h.frames();
+    assert_eq!(rows_of(&last_progress(&f)).len(), 10);
+    assert_eq!(rows_of(&last_progress(&f))[0].0, "name-p1");
 }

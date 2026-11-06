@@ -35,8 +35,18 @@ LMS's own ids (text), opaque to this service.
   2), 5 to 120 seconds per question (default 20), 500 players per game, one
   running game per session and per teacher.
 - Scoring: a right answer earns `1000 x (0.5 + 0.5 x remaining/limit)`, rounded;
-  multiple choice is scaled by its partial credit; wrong or none earns 0. The
-  scoreboard orders by total, then by total answer time.
+  multiple choice is scaled by its partial credit; wrong or none earns 0. A
+  **streak bonus** is added for answering fully correctly several questions in a
+  row: `min(100 x (n - 1), 500)` for the n-th in a row (nothing for the first); a
+  wrong, partly right or missing answer ends the streak and a player who joins
+  mid-game starts at 0. The scoreboard orders by total, then by total answer
+  time (a question not answered counts as its whole time limit).
+- The host sees the class live: how many chose each option, the names of those
+  who join, and a **provisional top ten** that is updated as answers arrive (at
+  most every 500 ms). An answer is scored when it arrives, with the figures the
+  close will apply, so the provisional ranking is the final one. Players are
+  never sent any of it while a question is open: a moving ranking would tell an
+  unanswered student which option is right.
 - Answer keys never leave the service before a question's reveal.
 - Answers are held in memory during a question and written in **one
   transaction when it closes**: a class answering together is one write.
@@ -319,16 +329,18 @@ at its default of 2), a typical question (80 characters, four options of 30):
 
 | | 300 players | 1,000 players (2 classes) | budget |
 |---|---:|---:|---:|
-| received per player per question | 421 B | 422 B | 1,024 B |
+| received per player per question | 427 B | 427 B | 1,024 B |
 | sent per player per question | 13 B | 13 B | 64 B |
 | frames received per player per question | 3 | 3 | |
-| whole class reached after a question opens (slowest) | 4.6 ms | 12.2 ms | 100 ms |
-| last answer to the reveal received everywhere (slowest) | 4.6 ms | 12.5 ms | |
-| memory per idle socket | 15.4 KiB | 11.9 KiB | 20 KiB |
-| idle RSS | 7.2 MiB | 7.2 MiB | 20 MiB |
-| question close (reveal and one write), mean | 13.0 ms | 43.6 ms | |
-| service CPU per question (whole class) | 33 ms | 132 ms | |
-| write conflicts retried | 0 | 11 | |
+| whole class reached after a question opens (slowest) | 20.2 ms | 18.9 ms | 100 ms |
+| last answer to the reveal received everywhere (slowest) | 9.9 ms | 12.8 ms | |
+| memory per idle socket | 17.2 KiB | 11.7 KiB | 20 KiB |
+| idle RSS | 7.3 MiB | 7.2 MiB | 20 MiB |
+| question close (reveal and one write), mean | 33.9 ms | 42.0 ms | |
+| service CPU per question (whole class) | 45 ms | 135 ms | |
+| write conflicts retried | 0 | 12 | |
+| host: one progress frame (counts and provisional top ten) | 254 B | 258 B | |
+| host: the one full-names frame after its hello | 4.5 KB (300) | 7.5 KB (500) | |
 
 A 120-character explanation adds about 120 B to what a player receives (539 B).
 Websocket permessage-deflate is not used: the websocket library the service

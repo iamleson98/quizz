@@ -39,7 +39,10 @@ pub struct AnswerWrite {
     pub selected: Vec<i64>,
     pub correct: bool,
     pub credit: f64,
+    /// Points earned, the streak bonus included.
     pub points: i64,
+    /// The streak bonus part of `points`.
+    pub bonus: i64,
     pub time_ms: i64,
 }
 
@@ -105,8 +108,8 @@ pub async fn write_batch(conn: &mut SqliteConnection, batch: &Batch) -> AppResul
     }
     for a in &batch.answers {
         sqlx::query(
-            "INSERT INTO answers (id, game_id, player_id, question_id, selected, correct, credit, points, time_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO answers (id, game_id, player_id, question_id, selected, correct, credit, points, bonus, time_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(a.id)
         .bind(batch.game_id)
@@ -116,6 +119,7 @@ pub async fn write_batch(conn: &mut SqliteConnection, batch: &Batch) -> AppResul
         .bind(a.correct)
         .bind(a.credit)
         .bind(a.points)
+        .bind(a.bonus)
         .bind(a.time_ms)
         .execute(&mut *conn)
         .await?;

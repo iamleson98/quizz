@@ -737,3 +737,67 @@ async fn one_running_game_per_teacher_across_sessions() {
         StatusCode::NO_CONTENT
     );
 }
+
+#[tokio::test]
+async fn the_host_sees_names_and_selections_and_players_see_neither() {
+    let s = serve(&[]).await;
+    let quiz_id = s.quiz("teacher1").await;
+    let (mut host, _) = s.join(&host_ticket(&s, "teacher1")).await;
+    let (mut a, _) = s.join(&player_ticket(&s, "student1")).await;
+    let (mut b, _) = s.join(&player_ticket(&s, "student2")).await;
+
+    send(&mut host, json!([1, quiz_id])).await;
+    let names = recv_kind(&mut host, 10).await;
+    let mut listed: Vec<String> = names[1]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect();
+    let mut more = Vec::new();
+    // the lobby may report the two names in one frame or two
+    while listed.len() + more.len() < 2 {
+        let f = recv_kind(&mut host, 10).await;
+        more.extend(
+            f[1].as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap().to_string()),
+        );
+    }
+    listed.extend(more);
+    listed.sort();
+    assert_eq!(listed, vec!["Name student1", "Name student2"]);
+
+    send(&mut host, json!([2])).await;
+    recv_kind(&mut a, 2).await;
+    recv_kind(&mut b, 2).await;
+    send(&mut a, json!([4, 1, 1])).await; // right
+    let progress = recv_kind(&mut host, 4).await;
+    assert_eq!(
+        progress.as_array().unwrap()[..4],
+        [json!(4), json!(1), json!(2), json!([1, 0, 0, 0])],
+        "one player chose option 1"
+    );
+    let ranking = progress[4].as_array().unwrap();
+    assert_eq!(ranking.len(), 2);
+    assert_eq!(
+        ranking[0][0], "Name student1",
+        "the player who answered leads"
+    );
+    assert!(ranking[0][1].as_i64().unwrap() > 900);
+    assert_eq!(ranking[1][1], 0);
+
+    // the players got an ack and the reveal, nothing about names or counts
+    send(&mut b, json!([4, 1, 2])).await;
+    for p in [&mut a, &mut b] {
+        loop {
+            let f = recv(p).await;
+            assert!(f[0] != 4 && f[0] != 10, "players were sent {f}");
+            if f[0] == 5 {
+                break;
+            }
+        }
+    }
+    send(&mut host, json!([3])).await;
+}

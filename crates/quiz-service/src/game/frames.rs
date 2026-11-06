@@ -31,6 +31,7 @@ pub mod server {
     pub const ENDED: u8 = 7;
     pub const ERROR: u8 = 8;
     pub const ACK: u8 = 9;
+    pub const NAMES: u8 = 10;
 }
 
 /// Why a game ended (`ended` frame).
@@ -94,14 +95,18 @@ pub enum Out {
 pub enum Tail {
     /// A question seen again after reconnecting: the options already chosen.
     Mask(u32),
-    /// The reveal: score, rank (0 = unranked), points earned, right (0/1),
-    /// the options chosen (0 = no answer).
+    /// The reveal: score, rank (0 = unranked), points earned (the streak
+    /// bonus included), right (0/1), the options chosen (0 = no answer),
+    /// the streak of fully right answers after this question, and the part
+    /// of `points` that is the streak bonus.
     Reveal {
         score: i64,
         rank: u32,
         points: i64,
         correct: bool,
         mask: u32,
+        streak: u32,
+        bonus: i64,
     },
     /// The podium: score and rank.
     Podium { score: i64, rank: u32 },
@@ -123,7 +128,13 @@ impl Out {
                         points,
                         correct,
                         mask,
-                    } => write!(s, ",{score},{rank},{points},{},{mask}", correct as u8),
+                        streak,
+                        bonus,
+                    } => write!(
+                        s,
+                        ",{score},{rank},{points},{},{mask},{streak},{bonus}",
+                        correct as u8
+                    ),
                     Tail::Podium { score, rank } => write!(s, ",{score},{rank}"),
                 }
                 .ok()?;
@@ -158,9 +169,34 @@ pub fn count(players: usize) -> Utf8Bytes {
     Utf8Bytes::from(format!("[{},{players}]", server::COUNT))
 }
 
-/// `[4,answered,players]` (host only)
-pub fn progress(answered: usize, players: usize) -> Utf8Bytes {
-    Utf8Bytes::from(format!("[{},{answered},{players}]", server::PROGRESS))
+/// `[4,answered,players,[c0,c1,...],[["name",total],...]]` (host only):
+/// `counts[i]` is how many players have chosen option `i` so far, and the
+/// last element is the provisional top ten by total score.
+pub fn progress(answered: usize, players: usize, counts: &[u32], top: &[(&str, i64)]) -> Utf8Bytes {
+    let mut s = format!("[{},{answered},{players},[", server::PROGRESS);
+    for (i, c) in counts.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{c}");
+    }
+    s.push_str("],");
+    push_rows(&mut s, top);
+    s.push(']');
+    Utf8Bytes::from(s)
+}
+
+/// `[10,["name",...]]` (host only): display names of players who joined.
+pub fn names(names: &[&str]) -> Utf8Bytes {
+    let mut s = format!("[{},[", server::NAMES);
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&js(n));
+    }
+    s.push_str("]]");
+    Utf8Bytes::from(s)
 }
 
 /// The open prefix of the question frame:
@@ -322,6 +358,8 @@ mod tests {
                 points: 900,
                 correct: true,
                 mask: 2,
+                streak: 3,
+                bonus: 200,
             },
         )
         .into_text()
@@ -329,8 +367,35 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             v,
-            serde_json::json!([5, 1, 2, [3, 4], null, [["Lan", 900]], 900, 1, 900, 1, 2])
+            serde_json::json!([
+                5,
+                1,
+                2,
+                [3, 4],
+                null,
+                [["Lan", 900]],
+                900,
+                1,
+                900,
+                1,
+                2,
+                3,
+                200
+            ])
         );
+    }
+
+    #[test]
+    fn host_frames_for_selections_and_names() {
+        assert_eq!(
+            &*progress(3, 10, &[2, 0, 1, 0], &[("An", 1100), ("Bình", 900)]),
+            "[4,3,10,[2,0,1,0],[[\"An\",1100],[\"Bình\",900]]]"
+        );
+        assert_eq!(
+            &*names(&["An", "Bình \"B\""]),
+            "[10,[\"An\",\"Bình \\\"B\\\"\"]]"
+        );
+        assert_eq!(&*names(&[]), "[10,[]]");
     }
 
     #[test]

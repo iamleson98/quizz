@@ -11,7 +11,7 @@
 
 use super::frames::{self, ClientFrame, EndReason, Out, Tail};
 use super::registry::Deps;
-use super::scoring::points_for;
+use super::scoring::{points_for, streak_bonus};
 use super::spans::SpanBook;
 use crate::auth::Role;
 use crate::error::{AppError, AppResult};
@@ -34,6 +34,8 @@ pub const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 pub const IDLE_LIMIT: Duration = Duration::from_secs(60 * 60);
 /// Frames a socket may have waiting before it is cut as too slow.
 pub const OUT_QUEUE: usize = 8;
+/// Rows of the host's provisional ranking.
+pub const PROVISIONAL_TOP: usize = 10;
 /// How many commands may wait for the room.
 const CMD_QUEUE: usize = 1024;
 
@@ -135,7 +137,11 @@ struct Answer {
     mask: u32,
     correct: bool,
     credit: f64,
+    /// Points for this answer, the streak bonus included once the question
+    /// has closed.
     points: i64,
+    /// The streak bonus part of `points`.
+    bonus: i64,
     time_ms: i64,
 }
 
@@ -150,6 +156,8 @@ struct Player {
     score: i64,
     total_ms: i64,
     correct_count: i64,
+    /// Fully right answers in a row, as of the last reveal.
+    streak: u32,
     /// Sockets of this player attached now.
     live: u32,
     /// In the roster (a lobby player who left is not).
@@ -174,6 +182,10 @@ struct Game {
     by_user: HashMap<String, usize>,
     active_count: usize,
     answered: usize,
+    /// How many players have chosen each option of the open question.
+    choices: Vec<u32>,
+    /// Names of players who joined since the last names frame to the host.
+    new_names: Vec<String>,
     /// Player indexes best first, as of the last reveal.
     standings: Vec<usize>,
     pending: Vec<AnswerWrite>,
@@ -197,6 +209,31 @@ impl Game {
             }
         }
         (eligible, answered)
+    }
+
+    /// The provisional top ten while a question is open: every player's
+    /// total before it plus what their answer has earned so far, ties broken
+    /// by total answer time so far, then by who joined first. These are the
+    /// very points the close will apply.
+    fn provisional_top(&self) -> Vec<(&str, i64)> {
+        let total = |p: &Player| p.score + p.answer.as_ref().map_or(0, |a| a.points);
+        let time = |p: &Player| p.total_ms + p.answer.as_ref().map_or(0, |a| a.time_ms);
+        let mut order: Vec<usize> = (0..self.players.len())
+            .filter(|&i| self.players[i].active)
+            .collect();
+        order.sort_by(|&a, &b| {
+            let (pa, pb) = (&self.players[a], &self.players[b]);
+            total(pb)
+                .cmp(&total(pa))
+                .then(time(pa).cmp(&time(pb)))
+                .then(pa.joined_at.cmp(&pb.joined_at))
+                .then(a.cmp(&b))
+        });
+        order
+            .into_iter()
+            .take(PROVISIONAL_TOP)
+            .map(|i| (self.players[i].name.as_str(), total(&self.players[i])))
+            .collect()
     }
 
     fn rows(&self, take: usize) -> Vec<(&str, i64)> {
@@ -432,6 +469,9 @@ impl Room {
         );
         let sync = self.sync_frame(m.sock);
         self.push(m.sock, sync);
+        if m.role == Role::Host {
+            self.send_host_catch_up(m.sock);
+        }
         if m.role == Role::Player && self.game.is_some() {
             self.mark_count_dirty();
         }
@@ -602,6 +642,8 @@ impl Room {
             by_user: HashMap::new(),
             active_count: 0,
             answered: 0,
+            choices: Vec::new(),
+            new_names: Vec::new(),
             standings: Vec::new(),
             pending: Vec::new(),
             rc_at,
@@ -611,13 +653,19 @@ impl Room {
         };
         self.spans.begin(id, &self.sid, self.deps.track_spans, now);
         // Everyone already in the room is in the game.
+        // (in the order they arrived, so "who joined first" means something)
         let mut full = Vec::new();
-        for (sid, s) in self.socks.iter_mut() {
+        let mut arrived: Vec<u64> = self.socks.keys().copied().collect();
+        arrived.sort_unstable();
+        for sid in arrived {
+            let Some(s) = self.socks.get_mut(&sid) else {
+                continue;
+            };
             self.spans.attach(&s.user, s.role, wall);
             if s.role == Role::Player {
                 match join(&mut game, &s.user, &s.name, wall) {
                     Ok(pid) => s.pid = Some(pid),
-                    Err(_) => full.push(*sid),
+                    Err(_) => full.push(sid),
                 }
             }
         }
@@ -627,7 +675,11 @@ impl Room {
         }
         let g = self.game.as_ref().expect("just set");
         let frame = frames::lobby(wall, &g.title, g.questions.len(), g.active_count);
+        let has_names = !g.new_names.is_empty();
         self.broadcast_shared(frame);
+        if has_names {
+            self.schedule_flush();
+        }
         Ok(())
     }
 }
@@ -646,6 +698,7 @@ fn join(g: &mut Game, user: &str, name: &str, wall: i64) -> AppResult<usize> {
             p.active = true;
             p.first_question = first;
             g.active_count += 1;
+            g.new_names.push(p.name.clone());
         }
         return Ok(pid);
     }
@@ -662,6 +715,7 @@ fn join(g: &mut Game, user: &str, name: &str, wall: i64) -> AppResult<usize> {
         score: 0,
         total_ms: 0,
         correct_count: 0,
+        streak: 0,
         live: 1,
         active: true,
         dirty: true,
@@ -670,6 +724,7 @@ fn join(g: &mut Game, user: &str, name: &str, wall: i64) -> AppResult<usize> {
     });
     g.by_user.insert(user.to_string(), pid);
     g.active_count += 1;
+    g.new_names.push(name.to_string());
     Ok(pid)
 }
 
@@ -776,17 +831,50 @@ impl Room {
         let (progress, count) = (self.progress_dirty, self.count_dirty);
         self.progress_dirty = false;
         self.count_dirty = false;
+        let Some(g) = &mut self.game else { return };
+        let names = std::mem::take(&mut g.new_names);
+        let frame = match g.phase {
+            Phase::Lobby if count => Some((true, frames::count(g.active_count))),
+            Phase::Question if progress || count => Some((
+                false,
+                frames::progress(g.answered, g.active_count, &g.choices, &g.provisional_top()),
+            )),
+            _ => None,
+        };
+        match frame {
+            Some((true, frame)) => self.broadcast_shared(frame),
+            Some((false, frame)) => self.broadcast_hosts(frame),
+            None => {}
+        }
+        if !names.is_empty() {
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            self.broadcast_hosts(frames::names(&refs));
+        }
+    }
+
+    /// What a host that just said hello needs besides the state frame: the
+    /// names of everyone in the room (once), and the live selections of an
+    /// open question.
+    fn send_host_catch_up(&mut self, sock: u64) {
         let Some(g) = &self.game else { return };
-        match g.phase {
-            Phase::Lobby if count => {
-                let frame = frames::count(g.active_count);
-                self.broadcast_shared(frame);
-            }
-            Phase::Question if progress || count => {
-                let frame = frames::progress(g.answered, g.active_count);
-                self.broadcast_hosts(frame);
-            }
-            _ => {}
+        let all: Vec<&str> = g
+            .players
+            .iter()
+            .filter(|p| p.active && !p.name.is_empty())
+            .take(MAX_PLAYERS_PER_GAME)
+            .map(|p| p.name.as_str())
+            .collect();
+        let mut frames_out = vec![frames::names(&all)];
+        if g.phase == Phase::Question {
+            frames_out.push(frames::progress(
+                g.answered,
+                g.active_count,
+                &g.choices,
+                &g.provisional_top(),
+            ));
+        }
+        for f in frames_out {
+            self.push(sock, Out::Plain(f));
         }
     }
 
@@ -822,6 +910,7 @@ impl Room {
         g.q_started = now;
         g.q_deadline = now + limit;
         g.answered = 0;
+        g.choices = vec![0; g.questions[qi].options.len()];
         g.reveal = None;
         for p in &mut g.players {
             p.answer = None;
@@ -873,9 +962,18 @@ impl Room {
         let graded = grade_question(question, &chosen);
         let limit_ms = question.question.time_limit_sec * 1000;
         let elapsed = (now - g.q_started).as_millis() as i64;
+        // Scored now, with what the close will use: the speed part from the
+        // server's receive time, and the streak bonus from the streak the
+        // player had before this question. The close only applies it.
+        let bonus = if graded.correct {
+            streak_bonus(p.streak + 1)
+        } else {
+            0
+        };
         p.answer = Some(Answer {
             question_id: question.question.id,
-            points: points_for(graded.credit, elapsed, limit_ms),
+            points: points_for(graded.credit, elapsed, limit_ms) + bonus,
+            bonus,
             selected: graded.selected,
             mask,
             correct: graded.correct,
@@ -883,6 +981,9 @@ impl Room {
             time_ms: elapsed.min(limit_ms),
         });
         g.answered += 1;
+        for (bit, c) in g.choices.iter_mut().enumerate() {
+            *c += mask >> bit & 1;
+        }
         g.idle_at = now + IDLE_LIMIT;
         metrics::counter!("quiz_answers_total").increment(1);
         self.push(sock, Out::Plain(frames::ack()));
@@ -906,11 +1007,12 @@ impl Room {
         let mut counts = vec![0u32; question.options.len()];
         let limit_ms = question.question.time_limit_sec * 1000;
         for p in &mut g.players {
-            let Some(a) = &p.answer else {
+            let Some(a) = p.answer.as_ref() else {
                 // Not answering costs the whole limit in the tie-break, so it
-                // never beats a player who tried.
+                // never beats a player who tried, and it ends the streak.
                 if p.active && p.first_question <= g.qi {
                     p.total_ms += limit_ms;
+                    p.streak = 0;
                     p.dirty = true;
                 }
                 continue;
@@ -918,6 +1020,10 @@ impl Room {
             for (bit, c) in counts.iter_mut().enumerate() {
                 *c += a.mask >> bit & 1;
             }
+            // Only a fully right answer keeps a streak going; a wrong or a
+            // partly right one ends it. The points and the bonus were
+            // settled when the answer arrived.
+            p.streak = if a.correct { p.streak + 1 } else { 0 };
             p.score += a.points;
             p.total_ms += a.time_ms;
             p.correct_count += a.correct as i64;
@@ -930,6 +1036,7 @@ impl Room {
                 correct: a.correct,
                 credit: a.credit,
                 points: a.points,
+                bonus: a.bonus,
                 time_ms: a.time_ms,
             });
         }
@@ -1083,6 +1190,8 @@ fn reveal_tail(p: &Player) -> Tail {
         points: a.map_or(0, |a| a.points),
         correct: a.is_some_and(|a| a.correct),
         mask: a.map_or(0, |a| a.mask),
+        streak: p.streak,
+        bonus: a.map_or(0, |a| a.bonus),
     }
 }
 

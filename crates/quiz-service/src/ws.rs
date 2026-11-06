@@ -36,7 +36,9 @@ const REFILL_PER_SEC: f32 = 2.0;
 /// Per-socket buffer sizes: a few KB, not the library's 128 KiB defaults.
 const READ_BUFFER: usize = 1024;
 const WRITE_BUFFER: usize = 0;
-const MAX_WRITE_BUFFER: usize = 16 * 1024;
+/// A ceiling, not an allocation: the host's one full list of 500 names can
+/// be 30 KB.
+const MAX_WRITE_BUFFER: usize = 64 * 1024;
 
 pub async fn handler(
     State(state): State<AppState>,

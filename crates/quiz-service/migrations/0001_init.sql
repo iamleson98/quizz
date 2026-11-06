@@ -81,7 +81,8 @@ CREATE TABLE answers (
     selected    TEXT NOT NULL,      -- JSON array of chosen option ids
     correct     INTEGER NOT NULL,
     credit      REAL NOT NULL,      -- 0..1, partial credit for multiple choice
-    points      INTEGER NOT NULL,
+    points      INTEGER NOT NULL,   -- includes the streak bonus
+    bonus       INTEGER NOT NULL DEFAULT 0,
     time_ms     INTEGER NOT NULL
 );
 CREATE INDEX idx_answers_game   ON answers(game_id, question_id);

@@ -11,6 +11,13 @@ pub fn points_for(credit: f64, elapsed_ms: i64, limit_ms: i64) -> i64 {
     (1000.0 * (0.5 + 0.5 * remaining) * credit).round() as i64
 }
 
+/// Extra points for answering fully correctly several questions in a row:
+/// `min(100 x (streak - 1), 500)`, where `streak` counts the question just
+/// answered (nothing for the first, 100 for the second, up to 500).
+pub fn streak_bonus(streak: u32) -> i64 {
+    (100 * i64::from(streak.saturating_sub(1))).min(500)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -21,6 +28,13 @@ mod tests {
         assert_eq!(points_for(1.0, 10_000, 20_000), 750);
         assert_eq!(points_for(1.0, 20_000, 20_000), 500);
         assert_eq!(points_for(1.0, 25_000, 20_000), 500);
+    }
+
+    #[test]
+    fn the_streak_bonus_grows_by_100_and_stops_at_500() {
+        let bonuses: Vec<i64> = (0..9).map(streak_bonus).collect();
+        assert_eq!(bonuses, vec![0, 0, 100, 200, 300, 400, 500, 500, 500]);
+        assert_eq!(streak_bonus(1000), 500);
     }
 
     #[test]

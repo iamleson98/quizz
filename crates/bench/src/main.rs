@@ -202,6 +202,46 @@ fn server_wire(len: usize) -> u64 {
     (len + 2 + if len > 125 { 2 } else { 0 } + if len > 65535 { 6 } else { 0 }) as u64
 }
 
+/// What a host's socket received: bytes and frames, and the biggest `names`
+/// frame (type 10).
+#[derive(Default)]
+struct HostStats {
+    bytes: AtomicU64,
+    frames: AtomicU64,
+    names_bytes: AtomicU64,
+    progress_frames: AtomicU64,
+    progress_bytes_max: AtomicU64,
+}
+
+async fn host_task(stats: Arc<HostStats>, mut ws: futures::stream::SplitStream<Ws>) {
+    while let Some(msg) = ws.next().await {
+        let Ok(Message::Text(text)) = msg else {
+            match msg {
+                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                _ => break,
+            }
+        };
+        stats
+            .bytes
+            .fetch_add(server_wire(text.len()), Ordering::Relaxed);
+        stats.frames.fetch_add(1, Ordering::Relaxed);
+        match text.as_bytes().get(1..3) {
+            Some(b"10") => {
+                stats
+                    .names_bytes
+                    .fetch_max(server_wire(text.len()), Ordering::Relaxed);
+            }
+            Some(b"4,") => {
+                stats.progress_frames.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .progress_bytes_max
+                    .fetch_max(server_wire(text.len()), Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn player_task(shared: Arc<Shared>, idx: usize, mut ws: Ws, spread_ms: u64, show: bool) {
     let me = &shared.players[idx];
     while let Some(msg) = ws.next().await {
@@ -407,7 +447,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             tasks.push(tokio::spawn(player_task(sh, i, ws?, spread, show)));
         }
     }
-    let mut hosts = Vec::new();
+    let host_stats = Arc::new(HostStats::default());
+    let mut hosts: Vec<futures::stream::SplitSink<Ws, Message>> = Vec::new();
     for c in 0..classes {
         let host_token = mint(
             &key,
@@ -416,7 +457,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             "Bench Teacher",
             &sid_of(c),
         )?;
-        hosts.push(connect(&args, &host_token).await?);
+        let (sink, stream) = connect(&args, &host_token).await?.split();
+        tokio::spawn(host_task(host_stats.clone(), stream));
+        hosts.push(sink);
     }
     // let every hello settle: each socket gets its first (state) frame
     shared
@@ -436,6 +479,28 @@ async fn run(args: Args) -> anyhow::Result<()> {
     shared
         .wait("the lobby", |p| p.lobby.load(Ordering::Relaxed) != UNSET)
         .await?;
+    // A host that says hello once the lobby is full gets every name in ONE
+    // frame: measure its size.
+    let mut late_host = connect(
+        &args,
+        &mint(
+            &key,
+            Role::Host,
+            &teacher_of(0),
+            "Bench Teacher",
+            &sid_of(0),
+        )?,
+    )
+    .await?;
+    let mut full_names_bytes = 0;
+    while let Ok(Some(Ok(Message::Text(t)))) =
+        tokio::time::timeout(Duration::from_millis(500), late_host.next()).await
+    {
+        if t.starts_with("[10,") {
+            full_names_bytes = server_wire(t.len());
+        }
+    }
+    drop(late_host);
     let cpu_game_start = args.pid.and_then(proc_stats);
 
     struct Round {
@@ -590,6 +655,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
         "service: write transactions {:.0}, conflict retries {:.0}",
         counter("tx_commits_total"),
         counter("tx_retries_total")
+    );
+    let first_class = n.min(args.class_size);
+    println!(
+        "host (per class): {:.0} B and {:.1} frames per question; the one full-names frame for {first_class} players: {full_names_bytes} B",
+        host_stats.bytes.load(Ordering::Relaxed) as f64 / (classes * q) as f64,
+        host_stats.frames.load(Ordering::Relaxed) as f64 / (classes * q) as f64,
+    );
+    println!(
+        "host progress frames (counts and provisional top ten): {} over {} questions of {classes} class(es), the biggest {} B",
+        host_stats.progress_frames.load(Ordering::Relaxed),
+        q,
+        host_stats.progress_bytes_max.load(Ordering::Relaxed)
     );
     if let (Some(idle), Some(connected)) = (idle, connected) {
         println!(
