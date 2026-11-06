@@ -8,6 +8,11 @@
 //! last answer is in, memory per socket, CPU per question and the writes the
 //! service made.
 //!
+//! Scenario `quest`: the same class playing a quest game at human pace
+//! (an answer every 6 to 10 s) for a steady window, reporting bytes and frames
+//! per second per player, what a player sends per answer, the host's board
+//! rate, and the service's CPU and memory.
+//!
 //! The service must run with `QUIZ_TICKET_KEY` / `QUIZ_ALLOWED_ORIGINS` the
 //! bench is given (`--origin`, env `QUIZ_TICKET_KEY`). Raise `ulimit -n` for
 //! a thousand players.
@@ -50,7 +55,7 @@ struct Args {
     #[arg(long, default_value = "https://site.example")]
     origin: String,
 
-    /// Scenario: only `game` exists.
+    /// Scenario: `game` (a race) or `quest`.
     #[arg(long, default_value = "game")]
     scenario: String,
 
@@ -88,10 +93,16 @@ struct Args {
     #[arg(long)]
     pid: Option<u32>,
 
+    /// Seconds of the steady window measured by the `quest` scenario.
+    #[arg(long, default_value_t = 180)]
+    duration: u64,
+
     /// Print the first question and reveal frames a player received.
     #[arg(long, default_value_t = false)]
     show_frames: bool,
 }
+
+mod quest;
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -355,16 +366,16 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    if args.scenario != "game" {
-        bail!(
-            "unknown scenario `{}`: the only one is `game`",
-            args.scenario
-        );
+    if args.scenario != "game" && args.scenario != "quest" {
+        bail!("unknown scenario `{}`: `game` or `quest`", args.scenario);
     }
     let key = Secret::new(
         std::env::var("QUIZ_TICKET_KEY")
             .context("QUIZ_TICKET_KEY must be set (the service's ticket key)")?,
     );
+    if args.scenario == "quest" {
+        return quest::run(args, key).await;
+    }
     let http = reqwest::Client::new();
     let run_id = format!("{:08x}", rand::random::<u32>());
     let classes = args.players.div_ceil(args.class_size).max(1);
