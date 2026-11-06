@@ -95,19 +95,3 @@ CREATE TABLE answers (
 CREATE INDEX idx_answers_game   ON answers(game_id, question_id);
 CREATE INDEX idx_answers_player ON answers(player_id);
 
--- Connected stretches of running games (a host's, each player's), waiting to
--- be pushed to the Go server, which counts them as lesson time. A row stays
--- until the push that carried its end has been acknowledged and it is
--- closed; a host's open row is rewritten with a later `to_ms` every minute.
-CREATE TABLE spans_outbox (
-    game_id    INTEGER NOT NULL,
-    user_id    TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    role       TEXT NOT NULL CHECK (role IN ('host', 'player')),
-    from_ms    INTEGER NOT NULL,
-    to_ms      INTEGER NOT NULL,
-    closed     INTEGER NOT NULL DEFAULT 0,
-    -- the `to_ms` the Go server has acknowledged; -1 when none
-    pushed_ms  INTEGER NOT NULL DEFAULT -1,
-    PRIMARY KEY (game_id, user_id, from_ms)
-) WITHOUT ROWID;

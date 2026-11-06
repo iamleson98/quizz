@@ -60,8 +60,8 @@ LMS's own ids (text), opaque to this service.
   the class waits for it together.
 - Answers are held in memory during a question and written in **one
   transaction when it closes**: a class answering together is one write.
-- A game's connected minutes (the host's, each player's) are pushed to the LMS
-  server as *spans*: lesson time for the fee and attendance.
+- The service reports nothing to the LMS server: a game runs inside the lesson
+  and makes no outgoing call.
 
 ## Tickets
 
@@ -72,7 +72,7 @@ LMS's own ids (text), opaque to this service.
 | `name` | display name, shown on the scoreboard |
 | `role` | `teacher` (the bank only), `host` (the teacher of this session: the bank and running its game), `player` (a student of this session) |
 | `sid`, `cid` | session id and class id (`host` and `player` only) |
-| `rc` | when the room closes, unix ms (`host` and `player` only): the game ends then |
+| `rc` | when the room closes, unix ms (`host` and `player` only): the game ends then and the socket is closed 20 s later |
 | `iat` / `exp` | valid 10 minutes; a socket is checked once, when it opens |
 
 HTTP: `Authorization: Bearer <ticket>`. Websocket: the first frame, `hello`.
@@ -89,14 +89,12 @@ cargo build --release
 export QUIZ_TICKET_KEY=$(openssl rand -hex 32)
 export QUIZ_INTERNAL_KEY=$(openssl rand -hex 32)
 export QUIZ_ALLOWED_ORIGINS=http://localhost:5173
-QUIZ_DATABASE=/tmp/quiz.db QUIZ_SNAPSHOT_DIR= QUIZ_LMS_URL= \
+QUIZ_DATABASE=/tmp/quiz.db QUIZ_SNAPSHOT_DIR= \
   ./target/release/quiz-service
 ```
 
 The service refuses to start without the two keys (at least 32 bytes each) and
-the allowed origins. `QUIZ_SNAPSHOT_DIR=` (empty) turns snapshots off and
-`QUIZ_LMS_URL=` (empty) turns span pushing off, which is what you want without
-the LMS server beside it.
+the allowed origins. `QUIZ_SNAPSHOT_DIR=` (empty) turns snapshots off.
 
 The Docker image builds SQLite itself (`docker compose up --build`, with the keys
 in the environment).
@@ -221,7 +219,6 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
 | `QUIZ_DATABASE` | `quiz.db` (`/data/quiz.db` in the image) | SQLite file (`sqlite://` prefix tolerated) |
 | `QUIZ_SNAPSHOT_DIR` | `/data/snapshots` | where `quiz.db` snapshots are written; empty turns snapshots off |
 | `QUIZ_SNAPSHOT_INTERVAL_SECS` | `900` | time between snapshot attempts |
-| `QUIZ_LMS_URL` | `http://lms-server.lms.svc.cluster.local:8065` | the LMS server (plain http) that receives lesson-time spans; empty turns pushing off |
 | `QUIZ_WORKER_THREADS` | `2` | tokio worker threads: on its node the service shares cores with the SFU |
 | `QUIZ_BANK_WRITE_BURST` / `QUIZ_BANK_WRITES_PER_MINUTE` | `10` / `20` | writes to the bank (create, save, keep, delete) a person may make at once, and then per minute (429 with `Retry-After`) |
 | `QUIZ_WS_PING_SECS` / `QUIZ_WS_PONG_SECS` | `25` / `10` | websocket ping interval, and how long a peer has to answer it |
@@ -248,8 +245,7 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
 - **One replica.** The SQLite file takes an exclusive lock (`unix-excl`), so
   deploy with strategy `Recreate`. Restarting ends running games (the teacher
   starts the game again); everything already written stays. On `SIGTERM` the
-  service ends games, closes every open span, makes one last push to the LMS
-  server, closes sockets (1001) and exits.
+  service ends games, closes sockets (1001) and exits.
 - **Snapshots.** Every `QUIZ_SNAPSHOT_INTERVAL_SECS`, when anything changed, the
   database is copied with `VACUUM INTO` to `quiz.db.tmp` in `QUIZ_SNAPSHOT_DIR`,
   fsynced and renamed over `quiz.db` (atomic; works with the default
@@ -258,34 +254,11 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
   which the snapshot was current: it advances at **every** interval, also when
   nothing changed and no file was written, so an idle night is not a stale
   backup.
-- **Lesson-time spans.** The service notes each connected stretch of a running
-  game (game, session, user, role `host`|`player`, from, to) in an outbox table
-  and `POST`s them to `QUIZ_LMS_URL` + `/api/v4/lms/internal/quiz/spans`, header
-  `x-internal-key`, body `{"spans":[{"game_id","session_id","user_id","role",
-  "from","to"}]}` (`game_id` a decimal string, times in ms), at most 500 a
-  request, answer 204. Every open span (the host's and each connected player's)
-  is re-sent every 60 s with its end so far, and a span is sent for good when it
-  closes (disconnect, game end, `rc`, shutdown), so a crash of the service or an
-  unreachable Go server at the end of a lesson costs at most a minute of
-  attendance. A reconnect within 60 s extends the span; spans left open by a
-  crash are closed at the next start. The call is idempotent by (game, user,
-  from) and a span's end only grows. **Only what the server will certainly never
-  take is dropped** (and counted in `quiz_spans_dropped_total`): a malformed or
-  too large batch (400, 413, 422) and a span of a session the server says it
-  does not know (a 404 whose body id is
-  `app.lms.quiz.spans.session_unknown.app_error`). Everything else (401 when the
-  feature is off or the keys differ, 403, 408, 429, any other 404 such as an
-  older server without the route, 5xx, network errors) is retried with
-  exponential backoff and jitter (1 s to 5 min) and leaves the outbox
-  untouched. **Alert on `increase(quiz_spans_dropped_total[1h]) > 0`**: a dropped
-  span is lost lesson time. `quiz_spans_write_failures_total` counts spans the
-  outbox itself could not take (after one retry).
 - **Metrics** (internal `/metrics`): `quiz_games_running`,
   `quiz_players_connected`, `quiz_answers_total`,
   `quiz_question_close_seconds` (histogram), `tx_commits_total`,
   `tx_retries_total` (write conflicts), `tx_duration_seconds`,
-  `quiz_snapshot_last_success_seconds`, `quiz_db_size_bytes`, `quiz_spans_outbox_depth`,
-  `quiz_spans_pushed_total`, `quiz_spans_dropped_total`, and
+  `quiz_snapshot_last_success_seconds`, `quiz_db_size_bytes`, and
   `http_requests_total` / `http_request_duration_seconds` per route.
   `observability/` has a Prometheus config and a Grafana dashboard.
 - **Memory.** The SQLite defaults are sized for a 256 MiB pod: 4 connections x 4 MiB
@@ -327,11 +300,10 @@ fails with `SQLITE_BUSY_SNAPSHOT` and is retried.
 │   │   ├── auth.rs              # tickets
 │   │   ├── rest/                # the bank: handlers, bodies, OpenAPI
 │   │   ├── ws.rs                # one task per socket
-│   │   ├── game/                # rooms, frames, scoring, spans, registry
+│   │   ├── game/                # rooms, frames, scoring, registry
 │   │   │   └── quest/           # quest mode: state, chest odds, frames
-│   │   ├── repo/                # quizzes, games, the spans outbox
+│   │   ├── repo/                # quizzes, games
 │   │   ├── retention.rs         # the periods and the sweep
-│   │   ├── push.rs              # spans to the LMS server
 │   │   ├── snapshot.rs          # VACUUM INTO + atomic rename
 │   │   ├── server.rs            # the two routers
 │   │   ├── tx.rs                # the BEGIN CONCURRENT engine
@@ -357,15 +329,13 @@ cargo test
   fake store: the deadline, everyone answered, early close, late join,
   reconnect, scoring, partial credit, keys hidden before the reveal, role
   checks, one game per session and per teacher, 500 players, slow sockets, idle
-  and room-close endings, spans, forget.
+  and room-close endings, forget.
 - `tests/bank.rs` drives the REST router: tickets and roles, ownership (another
   owner's quiz is 404), every limit, validation `fields`, whole-quiz saves, ETag
   304, CORS preflight, compression, what the public listener does not serve.
-- `tests/game.rs` runs the real server on a port with websocket clients and a
-  fake LMS server: a three-question game with a host and players, reconnect,
-  origin / subprotocol / hello / ticket rules, socket, size and rate limits, and
-  spans (ordering, batches of 500, idempotency, retry after a 503, drop on a
-  404, shutdown flush, reconnect bridging).
+- `tests/game.rs` runs the real server on a port with websocket clients: a
+  three-question game with a host and players, reconnect, origin / subprotocol /
+  hello / ticket rules, socket, size and rate limits, and shutdown ending games.
 - `game/quest/tests.rs` runs quest mode under paused time with a scripted random
   source: the queue and its reshuffle, coins and the streak bonus, the pause, a
   missed question, every chest outcome and the odds by streak, steal targets and

@@ -4,8 +4,12 @@ use super::chest::{Draw, Outcome, SeededDraw, roll_for};
 use super::{ALLOWED_SECONDS, MIN_THINK_MS, PAUSE_MS, STANDINGS_EVERY};
 use crate::auth::Role;
 use crate::game::frames::ClientFrame;
+use crate::game::room::{EMPTY_ROOM_LIMIT, HOST_AWAY_LIMIT, ROOM_CLOSE_GRACE};
 use crate::game::store::LoadedQuiz;
-use crate::game::tests::{Client, World, adv, connect, kind, last_of, settle, world_with};
+use crate::game::tests::{
+    BASE, CLOSED, Client, World, adv, connect, connect_rc, ended_reason, kind, last_of, leave,
+    nothing_left, secs, settle, world_with,
+};
 use crate::grading::tests::question;
 use crate::model::QuestionKind;
 use serde_json::{Value, json};
@@ -1260,45 +1264,6 @@ async fn one_game_per_room_and_the_race_still_works_afterwards() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_spans_heartbeat_also_runs_while_a_quest_waits_in_the_lobby_and_on_the_podium() {
-    let q = Quest::new();
-    let p = q.player(1).await;
-    let mut h = q.host().await;
-    start(&h, 300, 0).await;
-    settle().await;
-    for _ in 0..3 {
-        adv(Duration::from_secs(61)).await;
-        h.frames();
-    }
-    let beats = |user: &str| {
-        q.w.store
-            .spans
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| s.user_id == user && !s.closed)
-            .count()
-    };
-    assert!(beats("teacher") >= 3, "the host, in the lobby");
-    assert!(beats("p1") >= 3, "and the player");
-
-    // on the podium after the time is up
-    h.send(ClientFrame::Next).await;
-    settle().await;
-    for _ in 0..5 {
-        adv(Duration::from_secs(61)).await;
-        h.frames();
-    }
-    let before = beats("teacher");
-    for _ in 0..3 {
-        adv(Duration::from_secs(61)).await;
-        h.frames();
-    }
-    assert!(beats("teacher") >= before + 3, "the podium too");
-    drop(p);
-}
-
-#[tokio::test(start_paused = true)]
 async fn an_answer_sooner_than_800_ms_after_the_question_is_refused_and_the_question_stays_open() {
     let q = Quest::new();
     let (_h, mut ps, cur) = running(&q, 1, 0).await;
@@ -1404,16 +1369,6 @@ fn ended_writes(q: &Quest) -> usize {
         .count()
 }
 
-fn closed_spans(q: &Quest) -> usize {
-    q.w.store
-        .spans
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|s| s.closed)
-        .count()
-}
-
 #[tokio::test(start_paused = true)]
 async fn ending_a_quest_in_play_shows_the_podium_stores_the_results_once_and_ends_on_the_next_end()
 {
@@ -1452,11 +1407,6 @@ async fn ending_a_quest_in_play_shows_the_podium_stores_the_results_once_and_end
     );
     assert!(last_of(&f, 7).is_none(), "not ended yet");
     assert_eq!(ended_writes(&q), 1, "stored when the podium opened");
-    assert_eq!(
-        closed_spans(&q),
-        0,
-        "the spans stay open until the game ends"
-    );
     // answers no longer count
     reply(&ps[2], &cur[2], right_mask(cur[2].id)).await;
     settle().await;
@@ -1467,10 +1417,6 @@ async fn ending_a_quest_in_play_shows_the_podium_stores_the_results_once_and_end
     settle().await;
     assert_eq!(last_of(&ps[0].frames(), 7).unwrap(), &json!([7, 0]));
     assert_eq!(ended_writes(&q), 1, "stored exactly once");
-    assert!(
-        closed_spans(&q) >= 4,
-        "host and three players: closed when the game ends"
-    );
     assert!(q.w.deps.rooms.running_quiz_ids().is_empty());
 }
 
@@ -1507,5 +1453,103 @@ async fn the_room_closing_or_idleness_during_the_podium_ends_a_quest_without_a_s
     }
     // an hour without a command: the end
     assert_eq!(ended_writes(&q), 1, "still one write");
-    assert!(closed_spans(&q) >= 3);
+    assert!(q.w.deps.rooms.running_quiz_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_quest_host_away_in_the_lobby_ends_it_with_reason_4_and_no_podium() {
+    let q = Quest::new();
+    let mut p = q.player(1).await;
+    let h = q.host().await;
+    start(&h, 300, 0).await;
+    settle().await;
+    p.trace();
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT - secs(1)).await;
+    assert!(p.trace().is_empty());
+    adv(secs(2)).await;
+    let t = p.trace();
+    assert_eq!(ended_reason(&t).as_deref(), Some("4"), "{t:?}");
+    assert!(t.iter().all(|f| !f.starts_with("[6,")), "no podium: {t:?}");
+    assert_eq!(ended_writes(&q), 1);
+    assert!(q.w.deps.rooms.running_quiz_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_quest_host_away_while_it_runs_shows_the_podium_stores_once_and_a_host_back_in_time_stays()
+ {
+    let q = Quest::new();
+    let (h, mut ps, _) = running(&q, 2, 0).await;
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT - secs(5)).await;
+    // back in time: nothing happens, however long the game goes on
+    let again = q.host().await;
+    adv(secs(60)).await;
+    assert_eq!(ended_writes(&q), 0);
+    assert!(ended_reason(&ps[0].trace()).is_none());
+    leave(&again).await;
+    adv(HOST_AWAY_LIMIT + secs(1)).await;
+    let t = ps[0].trace();
+    let podium = t.iter().position(|f| f.starts_with("[6,")).expect("podium");
+    let ended = t.iter().position(|f| f == "[7,4]").expect("reason 4");
+    assert!(podium < ended, "{t:?}");
+    assert_eq!(ended_writes(&q), 1, "stored once");
+    assert!(q.w.deps.rooms.running_quiz_ids().is_empty());
+    ps[1].trace();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_quest_host_away_on_the_podium_ends_it_without_a_second_write() {
+    let q = Quest::new();
+    let (h, mut ps, _) = running(&q, 2, 0).await;
+    h.send(ClientFrame::End).await;
+    settle().await;
+    ps[0].trace();
+    assert_eq!(ended_writes(&q), 1);
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT + secs(1)).await;
+    assert_eq!(ended_reason(&ps[0].trace()).as_deref(), Some("4"));
+    assert_eq!(ended_writes(&q), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_quest_with_no_socket_at_all_ends_after_five_minutes_and_frees_the_room() {
+    let q = Quest::new();
+    let (h, ps, _) = running(&q, 2, 0).await;
+    leave(&h).await;
+    for p in &ps {
+        leave(p).await;
+    }
+    adv(EMPTY_ROOM_LIMIT - secs(2)).await;
+    assert_eq!(q.w.deps.rooms.counts().running_games, 1);
+    assert_eq!(ended_writes(&q), 0);
+    adv(secs(4)).await;
+    nothing_left(&q.w);
+    assert_eq!(ended_writes(&q), 1, "stored once");
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_the_room_close_a_quest_ends_and_is_stored_before_its_sockets_close() {
+    let q = Quest::new();
+    let rc = BASE + 10 * 60_000;
+    let mut p = connect_rc(&q.w, "p1", Role::Player, rc).await;
+    let mut h = connect_rc(&q.w, "teacher", Role::Host, rc).await;
+    start(&h, 900, 0).await;
+    settle().await;
+    p.trace();
+    h.trace();
+    // the host keeps the game alive; the room closes under it
+    let mut t = Vec::new();
+    for _ in 0..10 {
+        adv(secs(60)).await;
+        h.send(ClientFrame::Next).await;
+        settle().await;
+        h.trace();
+        t.extend(p.trace());
+    }
+    assert!(t.iter().any(|f| f == "[7,1]"), "ended at rc: {t:?}");
+    assert_eq!(ended_writes(&q), 1);
+    adv(ROOM_CLOSE_GRACE + secs(1)).await;
+    assert_eq!(p.trace(), vec![CLOSED]);
+    nothing_left(&q.w);
 }

@@ -76,19 +76,11 @@ pub async fn sweep(state: &AppState, now_ms: i64) -> AppResult<Swept> {
 }
 
 /// A game that was running when the service stopped never ended properly:
-/// close it so its results start their own countdown, and close the spans it
-/// left open in the outbox (their last heartbeat is their end) so they are
-/// pushed and leave. At startup no room exists, so every open span is an orphan.
+/// close it so its results start their own countdown. At startup no room
+/// exists, so every unended game is an orphan.
 pub async fn close_orphaned_games(state: &AppState, now_ms: i64) -> AppResult<u64> {
     tx::write_tx(state, move |conn| {
         Box::pin(async move {
-            sqlx::query("UPDATE spans_outbox SET closed = 1 WHERE closed = 0")
-                .execute(&mut *conn)
-                .await?;
-            // already acknowledged up to their end: nothing left to push
-            sqlx::query("DELETE FROM spans_outbox WHERE closed = 1 AND pushed_ms >= to_ms")
-                .execute(&mut *conn)
-                .await?;
             let res = sqlx::query(
                 "UPDATE games SET ended_at = ?1, expires_at = ?1 + ?2 WHERE ended_at IS NULL",
             )

@@ -24,7 +24,6 @@ services:
       QUIZ_TICKET_KEY: ${QUIZ_TICKET_KEY:?set QUIZ_TICKET_KEY (at least 32 bytes)}
       QUIZ_INTERNAL_KEY: ${QUIZ_INTERNAL_KEY:?set QUIZ_INTERNAL_KEY (at least 32 bytes)}
       QUIZ_ALLOWED_ORIGINS: ${QUIZ_ALLOWED_ORIGINS:-http://localhost:5173}
-      QUIZ_LMS_URL: ${QUIZ_LMS_URL:-}
       QUIZ_TX_MODE: ${QUIZ_TX_MODE:-concurrent}
       QUIZ_OTEL_ENDPOINT: http://jaeger:4317
       RUST_LOG: info

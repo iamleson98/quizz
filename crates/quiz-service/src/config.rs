@@ -85,9 +85,6 @@ pub struct Config {
     /// Origins of the site's pages: the only ones CORS answers and a
     /// websocket upgrade accepts.
     pub allowed_origins: Vec<String>,
-    /// The Go server, where lesson-time spans are pushed; `None` turns
-    /// pushing off.
-    pub lms_url: Option<String>,
     /// Tokio worker threads: the node's SFU must keep its cores.
     pub worker_threads: usize,
     /// Writes to the bank (create, save, keep, delete) a person may make at
@@ -190,20 +187,6 @@ impl Config {
             return Err("QUIZ_ALLOWED_ORIGINS must list origins like https://example.org".into());
         }
 
-        // Unset means the in-cluster Go server; an empty value turns span
-        // pushing off.
-        let lms_url = match lookup("QUIZ_LMS_URL") {
-            None => Some("http://lms-server.lms.svc.cluster.local:8065".to_string()),
-            Some(v) if v.is_empty() => None,
-            Some(v) => Some(v.trim_end_matches('/').to_string()),
-        };
-        if let Some(url) = &lms_url
-            && !url.starts_with("http://")
-        {
-            return Err(
-                "QUIZ_LMS_URL must be a plain http:// URL (it is an in-cluster call)".into(),
-            );
-        }
         let pool_max = num("QUIZ_POOL_MAX", "4")? as u32;
         let pool_min = num("QUIZ_POOL_MIN", "2")? as u32;
         if pool_max == 0 || pool_min > pool_max {
@@ -235,7 +218,6 @@ impl Config {
             snapshot_dir,
             snapshot_interval: Duration::from_secs(snapshot_secs),
             allowed_origins,
-            lms_url,
             worker_threads,
             bank_write_burst: num("QUIZ_BANK_WRITE_BURST", "10")?.max(1) as u32,
             bank_writes_per_minute: num("QUIZ_BANK_WRITES_PER_MINUTE", "20")?.max(1) as u32,
@@ -321,7 +303,6 @@ mod tests {
             cfg.allowed_origins,
             vec!["https://site.example".to_string()]
         );
-        assert!(cfg.lms_url.unwrap().starts_with("http://lms-server"));
         assert_eq!((cfg.bank_write_burst, cfg.bank_writes_per_minute), (10, 20));
     }
 
@@ -363,17 +344,6 @@ mod tests {
             two.allowed_origins,
             vec!["https://a.org", "http://localhost:5173"]
         );
-    }
-
-    #[test]
-    fn empty_lms_url_turns_span_pushing_off() {
-        assert_eq!(
-            Config::from_lookup(lookup(&[("QUIZ_LMS_URL", "")]))
-                .unwrap()
-                .lms_url,
-            None
-        );
-        assert!(Config::from_lookup(lookup(&[("QUIZ_LMS_URL", "https://x")])).is_err());
     }
 
     #[test]

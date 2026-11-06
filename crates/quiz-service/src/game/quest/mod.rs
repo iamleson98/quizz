@@ -950,7 +950,6 @@ impl Room {
             rc_at,
             now,
         );
-        self.spans.begin(id, &self.sid, self.deps.track_spans, now);
         let mut arrived: Vec<u64> = self.socks.keys().copied().collect();
         arrived.sort_unstable();
         let mut full = Vec::new();
@@ -958,7 +957,6 @@ impl Room {
             let Some(s) = self.socks.get_mut(&sid) else {
                 continue;
             };
-            self.spans.attach(&s.user, s.role, wall);
             if s.role == Role::Player {
                 match quest.join(&s.user, &s.name, wall) {
                     Ok(pid) => {
@@ -1001,10 +999,11 @@ impl Room {
             }
             _ => {}
         }
-        self.spans.attach(&m.user, m.role, wall);
         if m.role == Role::Player {
             metrics::gauge!("quiz_players_connected").increment(1.0);
         }
+        let close_at = self.close_at(m.rc, now);
+        self.note_close_at(close_at);
         self.socks.insert(
             m.sock,
             Sock {
@@ -1013,6 +1012,7 @@ impl Room {
                 role: m.role,
                 cid: m.cid,
                 rc: m.rc,
+                close_at,
                 out: m.out,
                 pid,
             },
@@ -1048,9 +1048,6 @@ impl Room {
         let Some(s) = self.socks.remove(&sock) else {
             return;
         };
-        let now = Instant::now();
-        let wall = self.wall(now);
-        self.spans.detach(&s.user, wall, now);
         if let (Some(pid), Some(q)) = (s.pid, self.quest.as_mut()) {
             let p = &mut q.players[pid];
             p.socks.retain(|&x| x != sock);
@@ -1162,10 +1159,7 @@ impl Room {
     }
 
     pub(super) fn quest_next_wake(&self) -> Option<Instant> {
-        let q = self.quest.as_ref()?;
-        // the spans' heartbeat also runs while the quest waits in the lobby
-        // or on the podium
-        q.next_wake().min(Some(self.spans.next_tick))
+        self.quest.as_ref()?.next_wake()
     }
 
     pub(super) async fn quest_on_timer(&mut self) {
@@ -1191,10 +1185,6 @@ impl Room {
             self.quest_finish(EndReason::RoomClosed).await;
         } else if now >= idle_at {
             self.quest_finish(EndReason::Idle).await;
-        }
-        if self.quest.is_some() && now >= self.spans.next_tick {
-            let due = self.spans.tick(self.wall(now), now);
-            self.write_spans(due).await;
         }
     }
 
@@ -1262,16 +1252,26 @@ impl Room {
         }
     }
 
-    /// End the game: store the results (unless the podium already did), close
-    /// the spans, tell everyone.
+    /// The host has been away too long: a game being played goes to the
+    /// podium (the time is up), then it ends with [`EndReason::HostLeft`].
+    pub(super) async fn quest_host_left(&mut self) {
+        if let Some(q) = self.quest.as_mut()
+            && matches!(q.phase, QPhase::Running { .. })
+        {
+            let mut fx = Fx::default();
+            q.time_up(&mut fx);
+            self.apply_fx(fx);
+        }
+        self.quest_finish(EndReason::HostLeft).await;
+    }
+
+    /// End the game: store the results (unless the podium already did), tell
+    /// everyone.
     pub(super) async fn quest_finish(&mut self, reason: EndReason) {
         self.quest_store().await;
         if self.quest.take().is_none() {
             return;
         }
-        let ended_at = self.now_wall();
-        let closed = self.spans.close_all(ended_at);
-        self.write_spans(closed).await;
         for s in self.socks.values_mut() {
             s.pid = None;
         }

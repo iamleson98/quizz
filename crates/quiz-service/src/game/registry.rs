@@ -20,6 +20,18 @@ pub const MAX_UNKNOWN_SOCKETS: usize = 2000;
 /// because a school is one address (NAT) with a class behind it.
 pub const MAX_UNKNOWN_PER_IP: u32 = 64;
 
+/// What the registry holds (see [`Rooms::counts`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub rooms: usize,
+    pub running_games: usize,
+    /// People holding at least one socket.
+    pub people: usize,
+    pub sockets: usize,
+    pub unknown_addresses: usize,
+    pub unknown_sockets: usize,
+}
+
 /// What a room needs from the service around it.
 #[derive(Clone)]
 pub struct Deps {
@@ -27,8 +39,6 @@ pub struct Deps {
     /// The service clock, unix ms.
     pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub rooms: Rooms,
-    /// Whether lesson-time spans are recorded.
-    pub track_spans: bool,
     /// A fresh random source for each quest game: a CSPRNG in the service, a
     /// seeded one in tests.
     pub quest_draw: Arc<dyn Fn() -> Box<dyn super::quest::chest::Draw> + Send + Sync>,
@@ -217,6 +227,20 @@ impl Rooms {
     pub fn running_quiz_ids(&self) -> HashSet<i64> {
         let reg = self.0.reg.lock().expect("rooms lock");
         reg.running.values().map(|(_, q)| *q).collect()
+    }
+
+    /// What the registry holds right now (for tests and diagnostics): every
+    /// count is zero when nothing is connected.
+    pub fn counts(&self) -> Counts {
+        let reg = self.0.reg.lock().expect("rooms lock");
+        Counts {
+            rooms: reg.rooms.len(),
+            running_games: reg.running.len(),
+            people: reg.conns.len(),
+            sockets: reg.conns.values().map(VecDeque::len).sum(),
+            unknown_addresses: reg.unknown_by_ip.len(),
+            unknown_sockets: self.0.unknown.load(Ordering::Relaxed),
+        }
     }
 
     fn handles(&self) -> Vec<RoomHandle> {
