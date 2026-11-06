@@ -18,7 +18,7 @@
 
 use crate::error::{AppError, AppResult, is_busy_error};
 use crate::state::AppState;
-use sqlx::Executor;
+use sqlx::Connection;
 use sqlx::sqlite::SqliteConnection;
 use std::future::Future;
 use std::pin::Pin;
@@ -39,9 +39,28 @@ fn backoff(attempt: u32) -> Duration {
 /// Run `op` inside a write transaction, retrying the whole transaction on
 /// lock contention (SQLITE_BUSY*), up to `config.tx_max_retries` retries.
 ///
+/// The transaction runs in a task of its own and is **not cancelled with the
+/// caller**: a handler that is dropped (the client went away, the request
+/// timeout) while its write is in flight cannot leave a pooled connection
+/// inside an open `BEGIN CONCURRENT` (sqlx's guard cannot cover the instant
+/// between sending BEGIN and getting the guard back). The write simply
+/// finishes, commits or rolls back, and the connection returns clean. That is
+/// why `op` must own what it uses.
+///
 /// On success returns the operation's value. Metrics: transaction duration
 /// histogram, commit and retry counters.
-pub async fn write_tx<T, F>(state: &AppState, mut op: F) -> AppResult<T>
+pub async fn write_tx<T, F>(state: &AppState, op: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: for<'c> FnMut(&'c mut SqliteConnection) -> TxFuture<'c, T> + Send + 'static,
+{
+    let state = state.clone();
+    tokio::spawn(async move { run_write_tx(&state, op).await })
+        .await
+        .map_err(|e| AppError::Internal(format!("write transaction task: {e}")))?
+}
+
+async fn run_write_tx<T, F>(state: &AppState, mut op: F) -> AppResult<T>
 where
     T: Send,
     F: FnMut(&mut SqliteConnection) -> TxFuture<'_, T>,
@@ -51,75 +70,88 @@ where
     let mut attempt: u32 = 0;
 
     loop {
-        let mut conn = state.pool.acquire().await.map_err(AppError::from)?;
-
-        if let Err(e) = conn.execute(state.cfg.tx_mode.begin_stmt()).await {
-            // BEGIN itself can rarely hit SQLITE_BUSY (e.g. IMMEDIATE).
-            if is_busy_error(&e) && attempt < state.cfg.tx_max_retries {
-                metrics::counter!("tx_retries_total", "mode" => mode.as_str()).increment(1);
-                attempt += 1;
-                tokio::time::sleep(backoff(attempt)).await;
-                continue;
-            }
-            return Err(e.into());
-        }
-
-        match op(&mut conn).await {
-            Err(err) => {
-                // Best-effort rollback; the connection returns to the pool
-                // either way, sqlx also rolls back on drop if needed.
-                let _ = conn.execute("ROLLBACK").await;
-                // Operations in a CONCURRENT txn rarely surface busy errors
-                // themselves, but handle it for the IMMEDIATE/DEFERRED modes.
-                if matches!(err, AppError::Database(ref e) if is_busy_error(e))
-                    && attempt < state.cfg.tx_max_retries
-                {
+        // The connection lives only inside this block, so it is back in the
+        // pool before a retry sleeps.
+        let step = {
+            let mut conn = state.pool.acquire().await.map_err(AppError::from)?;
+            attempt_once(state, &mut conn, &mut op, started).await
+        };
+        match step {
+            Step::Done(value) => return Ok(value),
+            Step::Failed(err) => return Err(err),
+            Step::Busy(err) => {
+                if attempt < state.cfg.tx_max_retries {
                     metrics::counter!("tx_retries_total", "mode" => mode.as_str()).increment(1);
+                    tracing::debug!(attempt, error = %err, "write transaction conflicted, retrying");
                     attempt += 1;
                     tokio::time::sleep(backoff(attempt)).await;
-                    continue;
+                } else {
+                    return Err(err);
                 }
-                return Err(err);
             }
-            Ok(value) => {
-                // Serialize COMMITs in-process: cheaper than the SQLite
-                // busy-handler spinning on the WAL WRITER lock.
-                let commit = async {
-                    if state.cfg.commit_mutex {
-                        let _guard = state.commit_mutex.lock().await;
-                        conn.execute("COMMIT").await
-                    } else {
-                        conn.execute("COMMIT").await
-                    }
-                };
+        }
+    }
+}
 
-                match commit.await {
-                    Ok(_) => {
-                        state
-                            .commits
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        metrics::counter!("tx_commits_total", "mode" => mode.as_str()).increment(1);
-                        metrics::histogram!("tx_duration_seconds", "mode" => mode.as_str())
-                            .record(started.elapsed().as_secs_f64());
-                        return Ok(value);
-                    }
-                    Err(e) => {
-                        let _ = conn.execute("ROLLBACK").await;
-                        if is_busy_error(&e) && attempt < state.cfg.tx_max_retries {
-                            metrics::counter!("tx_retries_total", "mode" => mode.as_str())
-                                .increment(1);
-                            tracing::debug!(
-                                attempt,
-                                error = %e,
-                                "write transaction conflicted, retrying"
-                            );
-                            attempt += 1;
-                            tokio::time::sleep(backoff(attempt)).await;
-                            continue;
-                        }
-                        return Err(e.into());
-                    }
+/// How one attempt ended.
+enum Step<T> {
+    Done(T),
+    /// Lock contention: worth another attempt.
+    Busy(AppError),
+    Failed(AppError),
+}
+
+async fn attempt_once<T, F>(
+    state: &AppState,
+    conn: &mut SqliteConnection,
+    op: &mut F,
+    started: Instant,
+) -> Step<T>
+where
+    T: Send,
+    F: FnMut(&mut SqliteConnection) -> TxFuture<'_, T>,
+{
+    let mode = state.cfg.tx_mode;
+    let classify = |e: AppError| match &e {
+        AppError::Database(db) if is_busy_error(db) => Step::Busy(e),
+        _ => Step::Failed(e),
+    };
+    // The transaction is a sqlx guard: dropped at any await point (a client
+    // that went away, the request timeout) it rolls back and the connection
+    // is clean again.
+    let mut txn = match conn.begin_with(mode.begin_stmt()).await {
+        Ok(txn) => txn,
+        // BEGIN itself can rarely hit SQLITE_BUSY (e.g. IMMEDIATE).
+        Err(e) => return classify(e.into()),
+    };
+    match op(&mut txn).await {
+        Err(err) => {
+            // Roll back now (the guard would on drop) so the connection is
+            // clean before it goes back.
+            let _ = txn.rollback().await;
+            classify(err)
+        }
+        Ok(value) => {
+            // Serialize COMMITs in-process: cheaper than the SQLite
+            // busy-handler spinning on the WAL WRITER lock.
+            let committed = if state.cfg.commit_mutex {
+                let _guard = state.commit_mutex.lock().await;
+                txn.commit().await
+            } else {
+                txn.commit().await
+            };
+            match committed {
+                Ok(()) => {
+                    state
+                        .commits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::counter!("tx_commits_total", "mode" => mode.as_str()).increment(1);
+                    metrics::histogram!("tx_duration_seconds", "mode" => mode.as_str())
+                        .record(started.elapsed().as_secs_f64());
+                    Step::Done(value)
                 }
+                // the guard dropped with the failed commit: rolled back
+                Err(e) => classify(e.into()),
             }
         }
     }

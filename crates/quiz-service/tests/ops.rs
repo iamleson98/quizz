@@ -611,3 +611,66 @@ async fn orphaned_spans_are_closed_at_startup_and_a_forgotten_person_leaves_the_
         "the forgotten person's spans are purged"
     );
 }
+
+/// Poll `fut` exactly `polls` times, then drop it unfinished.
+async fn cancel_after<F: std::future::Future>(fut: F, polls: usize) {
+    let mut fut = Box::pin(fut);
+    for _ in 0..polls {
+        if futures::poll!(fut.as_mut()).is_ready() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn a_write_transaction_that_is_dropped_midway_leaves_the_connection_clean() {
+    // one connection: whatever the cancelled write left behind, the next write
+    // gets exactly that connection
+    let state = setup_with(&[("QUIZ_POOL_MAX", "1".into()), ("QUIZ_POOL_MIN", "1".into())]).await;
+    let insert = |tag: String| {
+        let state = state.clone();
+        async move {
+            quiz_service::tx::write_tx(&state, move |conn| {
+                let tag = tag.clone();
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO spans_outbox (game_id, user_id, session_id, role, from_ms, to_ms)
+                         VALUES (1, ?1, 's', 'player', 1, 2)",
+                    )
+                    .bind(tag)
+                    .execute(&mut *conn)
+                    .await?;
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                    Ok(())
+                })
+            })
+            .await
+        }
+    };
+    // cancel at every await point from the pool acquire to just before the
+    // commit, then write again on the same pool
+    for polls in 1..=14 {
+        cancel_after(insert(format!("dropped{polls}")), polls).await;
+        tokio::time::timeout(Duration::from_secs(5), insert(format!("after{polls}")))
+            .await
+            .unwrap_or_else(|_| panic!("the next write hangs after a drop at poll {polls}"))
+            .unwrap_or_else(|e| panic!("the next write fails after a drop at poll {polls}: {e}"));
+    }
+    // and reads on that connection see the newest data, not an old snapshot
+    let after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM spans_outbox WHERE user_id LIKE 'after%'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(after, 14, "every later write landed");
+    let in_tx: bool = {
+        let mut conn = state.pool.acquire().await.unwrap();
+        sqlx::Connection::begin(&mut *conn)
+            .await
+            .map(drop)
+            .is_ok()
+    };
+    assert!(in_tx, "the connection is not left inside a transaction");
+}

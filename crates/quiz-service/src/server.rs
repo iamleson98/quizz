@@ -144,7 +144,7 @@ async fn forget(
     }
     // Games running now first (a game the person hosts ends), then the rows.
     state.rooms.forget(&user_id).await;
-    let forgotten = tx::write_tx(&state, |conn| {
+    let forgotten = tx::write_tx(&state, move |conn| {
         let user_id = user_id.clone();
         Box::pin(async move { games::forget(conn, &user_id).await })
     })

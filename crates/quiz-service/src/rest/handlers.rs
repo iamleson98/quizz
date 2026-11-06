@@ -105,7 +105,7 @@ pub async fn create_quiz(
     ticket.require_bank()?;
     let input = Arc::new(new_quiz(body.title, body.description, body.questions)?);
     let (owner, keep, now) = (ticket.sub.clone(), body.kept, state.now_ms());
-    let id = tx::write_tx(&state, |conn| {
+    let id = tx::write_tx(&state, move |conn| {
         let (owner, input) = (owner.clone(), input.clone());
         Box::pin(async move { quizzes::create(conn, &owner, &input, keep, now).await })
     })
@@ -182,7 +182,7 @@ pub async fn update_quiz(
     let input = Arc::new(new_quiz(body.title, body.description, body.questions)?);
     not_while_running(&state, id)?;
     let (owner, now) = (ticket.sub.clone(), state.now_ms());
-    tx::write_tx(&state, |conn| {
+    tx::write_tx(&state, move |conn| {
         let (owner, input) = (owner.clone(), input.clone());
         Box::pin(async move { quizzes::update(conn, id, &owner, &input, now).await })
     })
@@ -213,7 +213,7 @@ pub async fn keep_quiz(
     ticket.require_bank()?;
     let id = quiz_id(&id)?;
     let (owner, keep, now) = (ticket.sub.clone(), body.kept, state.now_ms());
-    tx::write_tx(&state, |conn| {
+    tx::write_tx(&state, move |conn| {
         let owner = owner.clone();
         Box::pin(async move { quizzes::set_kept(conn, id, &owner, keep, now).await })
     })
@@ -248,7 +248,7 @@ pub async fn delete_quiz(
     let id = quiz_id(&id)?;
     not_while_running(&state, id)?;
     let owner = ticket.sub.clone();
-    tx::write_tx(&state, |conn| {
+    tx::write_tx(&state, move |conn| {
         let owner = owner.clone();
         Box::pin(async move { quizzes::delete(conn, id, &owner).await })
     })
