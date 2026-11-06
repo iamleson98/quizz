@@ -1,247 +1,342 @@
-# quiz-backend
+# quiz-service
 
-A high-performance **GraphQL quiz service** in Rust (axum + async-graphql + sqlx) on a
-**custom SQLite build**: the [`begin-concurrent`](https://github.com/sqlite/sqlite/tree/begin-concurrent)
-branch of the SQLite repository, compiled from source and **statically linked into the
-binary**, so sqlx transparently uses it instead of the system SQLite.
+A live quiz game for a classroom, and the teacher's quiz bank behind it. Rust
+(axum, sqlx) on a **custom SQLite**: the
+[`begin-concurrent`](https://github.com/sqlite/sqlite/tree/begin-concurrent) branch,
+compiled from source and statically linked into the binary.
+
+The teacher picks a quiz and starts a game in a live session; every student
+sees each question at once, with a time limit; when it closes everyone sees the
+right answer, how the class answered and the top of the scoreboard; the teacher
+decides when to move on; at the end there is a podium. The teacher then keeps
+the quiz and its results, or lets them go.
 
 ```text
-$ curl -s localhost:8080/healthz
+$ curl -s localhost:8081/healthz
 {"sqlite":"3.55.0","status":"ok","tx_mode":"concurrent","uptime_sec":1}
 ```
 
-## Why the begin-concurrent branch?
+## What it is
 
-Vanilla SQLite allows at most **one writer at a time**. The `begin-concurrent` branch adds
-optimistic **page-level locking**: transactions started with `BEGIN CONCURRENT` run
-concurrently and only serialize (and conflict-check) at `COMMIT`. A commit whose pages were
-touched by another writer fails with `SQLITE_BUSY_SNAPSHOT` and is simply retried.
-
-This service is built to make the most of that:
-
-| Technique | Where |
+| Part | Where |
 |---|---|
-| **Every write** runs in `BEGIN CONCURRENT` with automatic `SQLITE_BUSY_SNAPSHOT` retry (exponential backoff + jitter, metrics per retry) | `crates/quiz-service/src/tx.rs` |
-| **Random 62-bit primary keys** instead of auto-increment rowids — monotonically increasing ids funnel all concurrent inserts onto the *same* b-tree page and cause conflict storms (see `third_party/sqlite/doc/begin_concurrent.md`) | `src/ids.rs` |
-| **In-process COMMIT mutex** — the branch docs recommend serializing COMMITs with an application mutex instead of letting the busy-handler spin when all writers share one process | `src/tx.rs` |
-| `unix-excl` VFS (configurable) — more efficient locking for single-process use, per the branch docs | `src/db.rs` |
-| WAL journaling, `synchronous=NORMAL`, 32 MiB page cache, 256 MiB mmap, in-memory temp store | `src/db.rs` |
-| sqlx **linked against our static SQLite** via `SQLITE3_LIB_DIR` + a pkg-config shim (no bundled 3.46, no system lib) | `.cargo/config.toml`, `third_party/sqlite-build/` |
+| **The bank**: authoring, listing, keeping and deleting quizzes, and reading finished games' results. REST/JSON under `/v1`, described by [`openapi.json`](openapi.json) | public port 8080 |
+| **The game**: one websocket, `GET /ws`, subprotocol `quiz.v1`, compact frames. Written down in [`PROTOCOL.md`](PROTOCOL.md) | public port 8080 |
+| **Probes, metrics and the calls only the LMS server makes** | internal port 8081 |
 
-Measured on a 2 vCPU sandbox (server + load generator colocated), the spread-write
-scenario shows **+19 % graded attempts/s** over `BEGIN IMMEDIATE`:
+There are **no accounts, passwords or logins**. Everything the service knows
+about a person comes in a *ticket*: a short-lived HS256 JWT signed by the LMS
+server with a key only the two share. Quizzes and players are known by the
+LMS's own ids (text), opaque to this service.
 
-| Scenario (c=8, 10 s) | Mode | req/s | submit/s | p50 | p95 | p99 | errors |
-|---|---|---:|---:|---:|---:|---:|---:|
-| read | concurrent | **4 195** | — | 1.4 ms | 2.7 ms | 26 ms | 0 |
-| mixed (80/20) | concurrent | **2 200** | 369 | 1.8 ms | 13 ms | 34 ms | 0 |
-| write, 1 hot quiz | concurrent | 1 213 | 606 | 1.0 ms | 29 ms | 114 ms | 0 |
-| write, 1 hot quiz | immediate | 1 192 | 596 | — | — | — | 0 |
-| write, 8 quizzes | concurrent | **1 408** | **704** | 2.3 ms | 39 ms | 108 ms | 0 |
-| write, 8 quizzes | immediate | 1 185 | 592 | 1.8 ms | 31 ms | 103 ms | 0 |
+- Quizzes: single choice, multiple choice (partial credit) and true/false;
+  text only. 200 quizzes per teacher, 100 questions per quiz, question text 500
+  characters, options 200, 2 to 6 options (a true/false question has exactly
+  2), 5 to 120 seconds per question (default 20), 500 players per game, one
+  running game per session and per teacher.
+- Scoring: a right answer earns `1000 x (0.5 + 0.5 x remaining/limit)`, rounded;
+  multiple choice is scaled by its partial credit; wrong or none earns 0. The
+  scoreboard orders by total, then by total answer time.
+- Answer keys never leave the service before a question's reveal.
+- Answers are held in memory during a question and written in **one
+  transaction when it closes**: a class answering together is one write.
+- A game's connected minutes (the host's, each player's) are pushed to the LMS
+  server as *spans*: lesson time for the fee and attendance.
 
-The "1 hot quiz" case is deliberately adversarial: every writer touches the same
-leaderboard index page, the worst case for page-level locking. The retry engine absorbs
-every conflict (5 235 retries, **zero failed requests**). Spread writes across quizzes and
-`BEGIN CONCURRENT` pulls clearly ahead. Re-run everything yourself with
-`loadtest/compare-tx-modes.sh`.
+## Tickets
 
-## Features
+| Claim | Meaning |
+|---|---|
+| `iss` / `aud` | `lms` / `quiz`, both checked |
+| `sub` | the person's id (opaque, at most 64 characters) |
+| `name` | display name, shown on the scoreboard |
+| `role` | `teacher` (the bank only), `host` (the teacher of this session: the bank and running its game), `player` (a student of this session) |
+| `sid`, `cid` | session id and class id (`host` and `player` only) |
+| `rc` | when the room closes, unix ms (`host` and `player` only): the game ends then |
+| `iat` / `exp` | valid 10 minutes; a socket is checked once, when it opens |
 
-- **Auth**: register/login, Argon2id password hashing, HS256 JWT bearer tokens.
-- **Quizzes**: create/update/delete, public or private, optional time limit and max attempts.
-- **Questions**: single choice, multiple choice (partial credit), true/false — batched
-  creation, server-side grading (the client never sends correctness data).
-- **Gameplay**: start attempt → submit answers → instant graded result with per-question
-  breakdown; ownership and time-limit enforcement.
-- **Leaderboards**: top-N per quiz (window-function ranking) + **live updates over
-  GraphQL subscriptions** (`graphql-transport-ws` at `/graphql/ws`).
-- **Observability**: structured JSON logs (or pretty), OpenTelemetry OTLP/gRPC traces,
-  Prometheus `/metrics` (http + tx + business counters), per-operation tracing spans.
-- **Correctness under concurrency**: integration tests include 12 simultaneous submits
-  that must all commit with exact scores.
+HTTP: `Authorization: Bearer <ticket>`. Websocket: the first frame, `hello`.
+Never in a URL.
 
-## Layout
+## Quickstart
 
-```
-├── Cargo.toml                  # workspace: quiz-service + bench
-├── .cargo/config.toml          # env-var linking of the custom SQLite into libsqlite3-sys
-├── crates/quiz-service/        # the service (lib + bin + integration tests)
-│   ├── migrations/0001_init.sql
-│   └── src/
-│       ├── tx.rs               # BEGIN CONCURRENT engine (retry/backoff/metrics)
-│       ├── grading.rs          # single/multi/boolean + partial credit
-│       ├── db.rs               # pool, pragmas, migrations, demo seed
-│       ├── telemetry.rs        # OTel + Prometheus + tracing
-│       ├── auth.rs             # argon2 + JWT
-│       ├── repo/               # users / quizzes / attempts data access
-│       ├── graphql/            # schema, query/mutation/subscription roots
-│       └── main.rs
-├── crates/bench/               # quiz-bench load generator (Rust)
-├── scripts/build-sqlite.sh     # reproducible custom-SQLite build (pinned commit)
-├── third_party/sqlite-build/   # libsqlite3.a + headers + sqlite3.pc (generated, git-ignored)
-├── loadtest/                   # oha/wrk recipes + tx-mode comparison script
-├── observability/              # prometheus + grafana provisioning
-├── Dockerfile                  # multi-stage, SQLite built from source inside
-└── docker-compose.yml          # app + Jaeger + Prometheus + Grafana
-```
-
-## Quickstart (Docker)
+Requirements: Rust 1.88+, `cc`, `make`, `git`, `tclsh` (to build SQLite).
 
 ```bash
-docker compose up --build
-```
-
-| What | Where |
-|---|---|
-| GraphQL API | http://localhost:8080/graphql |
-| Playground | http://localhost:8080/playground |
-| Jaeger UI (traces) | http://localhost:16686 — service `quiz-service` |
-| Prometheus | http://localhost:9090 |
-| Grafana (dashboard provisioned) | http://localhost:3000 |
-| Demo account | user `demo`, password `demo1234` |
-
-The compose stack seeds a demo quiz on first boot (`QUIZ_SEED_DEMO=1`).
-
-## Quickstart (local)
-
-Requirements: Rust 1.85+, `cc`, `make`, `git`, `tclsh`. The custom SQLite is not committed
-(a static library is platform specific): build it once, then the service.
-
-```bash
-./scripts/build-sqlite.sh
+./scripts/build-sqlite.sh          # once: the custom SQLite into third_party/sqlite-build/
 cargo build --release
-QUIZ_DATABASE=/tmp/quiz.db QUIZ_LISTEN_ADDR=127.0.0.1:8080 RUST_LOG=info \
+
+export QUIZ_TICKET_KEY=$(openssl rand -hex 32)
+export QUIZ_INTERNAL_KEY=$(openssl rand -hex 32)
+export QUIZ_ALLOWED_ORIGINS=http://localhost:5173
+QUIZ_DATABASE=/tmp/quiz.db QUIZ_SNAPSHOT_DIR= QUIZ_LMS_URL= \
   ./target/release/quiz-service
 ```
 
-Run the test suite (17 tests incl. end-to-end flows and the concurrent-submit test):
+The service refuses to start without the two keys (at least 32 bytes each) and
+the allowed origins. `QUIZ_SNAPSHOT_DIR=` (empty) turns snapshots off and
+`QUIZ_LMS_URL=` (empty) turns span pushing off, which is what you want without
+the LMS server beside it.
+
+The Docker image builds SQLite itself (`docker compose up --build`, with the keys
+in the environment).
+
+## Try it with a ticket
+
+`mint-ticket` is a development tool: it signs a ticket with `QUIZ_TICKET_KEY`
+(in production the LMS server does this; the tool is not in the image).
 
 ```bash
-cargo test
+mint() { cargo run -q -p quiz-service --bin mint-ticket -- "$@"; }
+
+TEACHER=$(mint --role teacher --sub teacher1 --name "Ms Lan")
+HOST=$(mint --role host --sub teacher1 --name "Ms Lan" --sid session1 --cid class1)
+STUDENT=$(mint --role player --sub student1 --name "An" --sid session1 --cid class1)
 ```
 
-## API tour
-
-```graphql
-mutation { register(username: "alice", password: "password123") { token user { id username } } }
-# use the token:  Authorization: Bearer <token>
-
-mutation {
-  createQuiz(input: { title: "Rust Basics", isPublic: true }) { id }
-  # then addQuestions(quizId, input: [ ... ])
-}
-
-mutation {
-  startAttempt(quizId: "<quiz-id>") { id status startedAt }
-  submitAttempt(attemptId: "<attempt-id>", answers: [
-    { questionId: "<q1>", selectedOptionIds: ["<opt>"] },
-  ]) { score maxScore correctCount totalCount answers { correct awarded possible } }
-}
-
-query { leaderboard(quizId: "<quiz-id>", first: 10) { rank user { username } score } }
-
-subscription { leaderboardUpdated(quizId: "<quiz-id>") { entries { rank user { username } score } } }
-```
-
-All errors carry machine-readable codes: `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`,
-`BAD_REQUEST`, `CONFLICT`, `DATABASE_ERROR`, `TX_EXHAUSTED`, `INTERNAL_ERROR`.
-
-IDs are random 62-bit integers surfaced as GraphQL `ID` strings; timestamps are unix
-epoch **milliseconds**.
-
-## Benchmarks
+The bank, with `curl` (ids are strings; times are unix ms):
 
 ```bash
-cargo build --release
-./loadtest/compare-tx-modes.sh 20 8 8   # duration concurrency quizzes
-
-# or by hand:
-./target/release/quiz-bench --scenario write --concurrency 16 --duration 30 --quizzes 8
-./target/release/quiz-bench --scenario read  --concurrency 50 --duration 30
-./loadtest/oha-read.sh http://127.0.0.1:8080 30s 50
+API=http://127.0.0.1:8080
+curl -s -X POST $API/v1/quizzes -H "Authorization: Bearer $TEACHER" -H 'Content-Type: application/json' -d '{
+  "title": "Fractions", "description": "Warm-up",
+  "questions": [
+    {"kind": "single", "text": "1/2 + 1/2 = ?", "timeLimitSec": 20, "explanation": "One whole.",
+     "options": [{"text": "1", "isCorrect": true}, {"text": "2", "isCorrect": false}]},
+    {"kind": "boolean", "text": "0.5 equals 1/2",
+     "options": [{"text": "True", "isCorrect": true}, {"text": "False", "isCorrect": false}]}
+  ]}'                                                   # 201 + the quiz, with answer keys
+curl -s "$API/v1/quizzes?limit=20" -H "Authorization: Bearer $TEACHER"
+curl -s -i $API/v1/quizzes/<id> -H "Authorization: Bearer $TEACHER"       # ETag; send it back in If-None-Match for a 304
+curl -s -X PUT $API/v1/quizzes/<id> -H "Authorization: Bearer $TEACHER" -H 'Content-Type: application/json' -d @quiz.json
+curl -s -X PUT $API/v1/quizzes/<id>/kept -H "Authorization: Bearer $TEACHER" -H 'Content-Type: application/json' -d '{"kept": false}'
+curl -s $API/v1/quizzes/<id>/games -H "Authorization: Bearer $TEACHER"    # results of finished games
+curl -s -X DELETE $API/v1/quizzes/<id> -H "Authorization: Bearer $TEACHER"
 ```
 
-`quiz-bench` bootstraps its own users and quizzes, then reports throughput, per-operation
-latency percentiles and error counts. `--scenario write` is the `BEGIN CONCURRENT` hot
-path (start + grade + commit per iteration).
+A quiz is saved whole: `PUT` takes the title and the full question list. A
+question or option that carries the `id` it was read with keeps its identity
+(and the results recorded for it); one without an id is new; one left out is
+deleted. Errors use the real status and a body `{"code","message","fields"}`;
+`code` is `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `BAD_REQUEST`, `CONFLICT` or
+`INVALID` (422, with `fields: [{path, message}]` such as
+`questions[2].options[1].text`).
 
-## The custom SQLite build
+The game, with the socket (Node 22 or later has `WebSocket` built in):
 
-`scripts/build-sqlite.sh` clones the sqlite repository at a **pinned commit** on the
-`begin-concurrent` branch (SQLite 3.55.0 as of this pin), generates the amalgamation,
-and compiles `libsqlite3.a` with:
-
-- `-O3`, thread-safe, full-text-search (FTS3/4/5), R\*Tree/GeoPoly, STAT4, math functions
-- **sqlx compatibility set** mirrored from libsqlite3-sys' bundled build (API armor,
-  column metadata, unlock-notify, load extension, soundex, URI filenames, ...)
-- performance defaults: `SQLITE_DEFAULT_MEMSTATUS=0`, `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1`
-  (NORMAL), `LIKE_DOESNT_MATCH_BLOBS`
-
-sqlx then links this build instead of its bundled 3.46 via `.cargo/config.toml`:
-
-```toml
-[env]
-LIBSQLITE3_SYS_USE_PKG_CONFIG = "1"   # force libsqlite3-sys to its "linked" path
-SQLITE3_STATIC = "1"                  # prefer the .a over any system .so
-SQLITE3_LIB_DIR = { value = "third_party/sqlite-build/lib", relative = true }
-SQLITE3_INCLUDE_DIR = { value = "third_party/sqlite-build/include", relative = true }
+```bash
+node -e '
+const [host, player] = process.argv.slice(1);
+const open = (t, name) => { const ws = new WebSocket("ws://127.0.0.1:8080/ws", { protocols: ["quiz.v1"], headers: { origin: "http://localhost:5173" } });
+  ws.onopen = () => ws.send(JSON.stringify([0, t])); ws.onmessage = (m) => console.log(name, m.data); return ws; };
+const h = open(host, "host"), p = open(player, "student");
+setTimeout(() => h.send(JSON.stringify([1, "<quiz id>"])), 500);   // lobby
+setTimeout(() => h.send("[2]"), 1500);                              // first question
+setTimeout(() => p.send("[4,1,1]"), 2500);                          // answer question 1: option 1
+setTimeout(() => h.send("[3]"), 4000);                              // end
+setTimeout(() => process.exit(0), 4500);' "$HOST" "$STUDENT"
 ```
 
-`third_party/sqlite-build/lib/pkgconfig/sqlite3.pc` (path-portable via `${pcfiledir}`)
-ensures the pkg-config probe inside libsqlite3-sys resolves to *our* library even when a
-system SQLite is installed. Proof of linkage: `/healthz` reports the version, `ldd`
-shows no `libsqlite3.so`, and the integration tests assert `sqlite_version() = 3.55.0`.
+`PROTOCOL.md` has every frame. The OpenAPI document is generated from the code;
+`openapi.json` at the root is committed and a test fails when it is out of date
+(`UPDATE_OPENAPI=1 cargo test -p quiz-service --test openapi` rewrites it).
 
-To rebuild: `./scripts/build-sqlite.sh` (override with `SQLITE_GIT_REF=<ref>`). Build
-metadata is recorded in `third_party/sqlite-build/BUILD_INFO`.
+## Retention: nothing lasts for ever
 
-## Configuration (env)
+Every quiz carries the moment it expires (`expiresAt`), every finished game
+the moment its results do. A sweep, **at startup and daily**, deletes what has
+expired. The three periods are constants in `src/retention.rs`, not settings:
+
+| What | Expires |
+|---|---|
+| a kept quiz (made in the bank) | 90 days after its last use |
+| a quiz that is not kept (a quick quiz made in the room) | 7 days after its last use |
+| a finished game's results (players, answers) | 90 days after the game ended, even while its quiz stays |
+
+*Use* is saving an edit (create or update), starting a game on the quiz, or
+keeping / un-keeping it; each use moves the expiry a full period on, and
+keeping a quiz switches between the 7- and the 90-day period. Reading it,
+listing it and fetching its results are not uses. Deleting a quiz deletes its
+games at once. A game that was running when the service stopped is closed at
+the next start so its results start their own countdown.
+
+`POST /internal/users/{id}/forget` (header `x-internal-key`) deletes that
+person's quizzes and games, ends a game they host, and blanks their name on
+other teachers' scoreboards. The LMS server calls it when an account is deleted.
+
+## Configuration (environment)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `QUIZ_LISTEN_ADDR` | `0.0.0.0:8080` | HTTP listen address |
-| `QUIZ_DATABASE` | `quiz.db` | SQLite file path (`sqlite://` prefix tolerated) |
-| `QUIZ_JWT_SECRET` | dev secret (warns) | JWT signing key |
-| `QUIZ_JWT_TTL_HOURS` | `24` | token lifetime |
+| `QUIZ_TICKET_KEY` | **required** | HS256 key tickets are verified with (at least 32 bytes) |
+| `QUIZ_INTERNAL_KEY` | **required** | key of the `x-internal-key` header on `/internal/*` (at least 32 bytes), compared in constant time |
+| `QUIZ_ALLOWED_ORIGINS` | **required** | comma-separated origins of the site: CORS answers them only, and a websocket upgrade must come from one |
+| `QUIZ_LISTEN_ADDR` | `0.0.0.0:8080` | public listener: `/v1/*` and `/ws` |
+| `QUIZ_INTERNAL_ADDR` | `0.0.0.0:8081` | internal listener: `/healthz`, `/readyz`, `/metrics`, `/internal/*` |
+| `QUIZ_DATABASE` | `quiz.db` (`/data/quiz.db` in the image) | SQLite file (`sqlite://` prefix tolerated) |
+| `QUIZ_SNAPSHOT_DIR` | `/data/snapshots` | where `quiz.db` snapshots are written; empty turns snapshots off |
+| `QUIZ_SNAPSHOT_INTERVAL_SECS` | `900` | time between snapshot attempts |
+| `QUIZ_LMS_URL` | `http://lms-server.lms.svc.cluster.local:8065` | the LMS server (plain http) that receives lesson-time spans; empty turns pushing off |
+| `QUIZ_WORKER_THREADS` | `2` | tokio worker threads: on its node the service shares cores with the SFU |
 | `QUIZ_POOL_MAX` / `QUIZ_POOL_MIN` | `8` / `2` | sqlx pool size |
 | `QUIZ_BUSY_TIMEOUT_MS` | `5000` | per-connection busy timeout |
 | `QUIZ_TX_MODE` | `concurrent` | `concurrent` \| `deferred` \| `immediate` |
-| `QUIZ_TX_MAX_RETRIES` | `64` | write-tx retry budget on busy/snapshot conflicts |
+| `QUIZ_TX_MAX_RETRIES` | `64` | write-transaction retry budget on busy/snapshot conflicts |
 | `QUIZ_COMMIT_MUTEX` | `1` | serialize COMMITs in-process (recommended) |
 | `QUIZ_SQLITE_VFS` | `unix-excl` | `unix` if external tools need the live file |
 | `QUIZ_CACHE_SIZE_KIB` | `32768` | per-connection page cache |
 | `QUIZ_MMAP_SIZE` | `268435456` | mmap read limit |
 | `QUIZ_OTEL_ENDPOINT` | unset | OTLP gRPC endpoint (e.g. `http://jaeger:4317`) |
 | `QUIZ_LOG_FORMAT` | `json` | `json` \| `pretty` |
-| `QUIZ_SEED_DEMO` | `0` | idempotent demo user + quiz on boot |
 | `RUST_LOG` | `info` | tracing filter |
 
-## Operational notes
+## Operations
 
-- **Keep write transactions small**: concurrent transactions cannot spill their page
-  cache mid-transaction (enforced by the patch itself); each submit grades one attempt,
-  comfortably within the 32 MiB cache.
-- **unix-excl**: the default VFS locks the database file exclusively for the process —
-  the sqlite3 CLI cannot attach to the *live* file. Set `QUIZ_SQLITE_VFS=unix` when you
-  need that (small locking overhead).
-- **Leaderboard index**: the per-quiz leaderboard index is the one deliberate hotspot
-  (score + submission time of the same quiz cluster on a few pages). Contention there is
-  exactly what the retry engine is for; spread across quizzes and it disappears.
-- **Metrics of note**: `tx_retries_total{mode}` (conflict rate), `tx_duration_seconds`
-  (including retries), `attempts_submitted_total`, `http_request_duration_seconds`.
+- **One replica.** The SQLite file takes an exclusive lock (`unix-excl`), so
+  deploy with strategy `Recreate`. Restarting ends running games (the teacher
+  starts the game again); everything already written stays. On `SIGTERM` the
+  service ends games, closes every open span, makes one last push to the LMS
+  server, closes sockets (1001) and exits.
+- **Snapshots.** Every `QUIZ_SNAPSHOT_INTERVAL_SECS`, when anything changed, the
+  database is copied with `VACUUM INTO` to `quiz.db.tmp` in `QUIZ_SNAPSHOT_DIR`,
+  fsynced and renamed over `quiz.db` (atomic; works with the default
+  `unix-excl` VFS). The off-site copy takes `quiz.db` from there.
+  `quiz_snapshot_last_success_seconds` is the Unix time of the last interval at
+  which the snapshot was current: it advances at **every** interval, also when
+  nothing changed and no file was written, so an idle night is not a stale
+  backup.
+- **Lesson-time spans.** The service notes each connected stretch of a running
+  game (game, session, user, role `host`|`player`, from, to) in an outbox table
+  and `POST`s them to `QUIZ_LMS_URL` + `/api/v4/lms/internal/quiz/spans`, header
+  `x-internal-key`, body `{"spans":[{"game_id","session_id","user_id","role",
+  "from","to"}]}` (`game_id` a decimal string, times in ms), at most 500 a
+  request, answer 204. A host's open span is re-sent every 60 s with its end so
+  far; a player's is sent when it closes (disconnect, game end, `rc`, shutdown).
+  A reconnect within 60 s extends the span. The call is idempotent by (game,
+  user, from) and a span's end only grows. Network errors and 5xx are retried
+  with exponential backoff and jitter (1 s to 5 min); a 404 or any other 4xx
+  drops the span (counted).
+- **Metrics** (internal `/metrics`): `quiz_games_running`,
+  `quiz_players_connected`, `quiz_answers_total`,
+  `quiz_question_close_seconds` (histogram), `tx_commits_total`,
+  `tx_retries_total` (write conflicts), `tx_duration_seconds`,
+  `quiz_snapshot_last_success_seconds`, `quiz_spans_outbox_depth`,
+  `quiz_spans_pushed_total`, `quiz_spans_dropped_total`, and
+  `http_requests_total` / `http_request_duration_seconds` per route.
+  `observability/` has a Prometheus config and a Grafana dashboard.
+- **Keep write transactions small**: concurrent transactions cannot spill their
+  page cache mid-transaction (enforced by the patch itself).
+- **`unix-excl`** locks the database file exclusively for the process, so the
+  `sqlite3` CLI cannot attach to the live file; read a snapshot instead, or set
+  `QUIZ_SQLITE_VFS=unix`.
+
+## Why the begin-concurrent branch
+
+Vanilla SQLite allows one writer at a time. `begin-concurrent` adds optimistic
+page-level locking: transactions started with `BEGIN CONCURRENT` run together and
+only conflict-check at `COMMIT`; a commit whose pages another writer touched
+fails with `SQLITE_BUSY_SNAPSHOT` and is retried.
+
+| Technique | Where |
+|---|---|
+| Every write runs in `BEGIN CONCURRENT` with retry (exponential backoff and jitter, metrics per retry) | `src/tx.rs` |
+| Random 62-bit row ids: increasing ids funnel concurrent inserts onto one page | `src/ids.rs` |
+| An in-process COMMIT mutex, as the branch docs recommend for one process | `src/tx.rs` |
+| `unix-excl` VFS, WAL, `synchronous=NORMAL`, 32 MiB page cache, in-memory temp store | `src/db.rs` |
+| sqlx linked against our static SQLite through `SQLITE3_LIB_DIR` and a pkg-config shim | `.cargo/config.toml`, `scripts/build-sqlite.sh` |
+
+## Layout
+
+```
+├── openapi.json                 # the bank's API, generated and checked by a test
+├── PROTOCOL.md                  # the game socket
+├── crates/quiz-service/
+│   ├── migrations/0001_init.sql # the one baseline schema
+│   ├── src/
+│   │   ├── auth.rs              # tickets
+│   │   ├── rest/                # the bank: handlers, bodies, OpenAPI
+│   │   ├── ws.rs                # one task per socket
+│   │   ├── game/                # rooms, frames, scoring, spans, registry
+│   │   ├── repo/                # quizzes, games, the spans outbox
+│   │   ├── retention.rs         # the periods and the sweep
+│   │   ├── push.rs              # spans to the LMS server
+│   │   ├── snapshot.rs          # VACUUM INTO + atomic rename
+│   │   ├── server.rs            # the two routers
+│   │   ├── tx.rs                # the BEGIN CONCURRENT engine
+│   │   └── bin/mint-ticket.rs   # dev tool
+│   └── tests/                   # bank, game (real sockets), ops, openapi
+├── crates/bench/                # quiz-bench
+├── scripts/build-sqlite.sh      # reproducible custom-SQLite build (pinned commit)
+├── observability/               # prometheus + grafana
+├── Dockerfile
+└── docker-compose.yml           # app + Jaeger + Prometheus + Grafana
+```
 
 ## Testing
 
 ```bash
-cargo test                 # 10 unit + 7 integration tests
-cargo clippy --all-targets
+./scripts/build-sqlite.sh
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-Integration tests spin the real router on temp SQLite files and cover: full play flow
-with partial credit and hidden answers, auth/ownership, validation, time limits,
-max attempts, health/metrics endpoints, and 12-way concurrent submits.
+- Room and game logic runs under `#[tokio::test(start_paused = true)]` against a
+  fake store: the deadline, everyone answered, early close, late join,
+  reconnect, scoring, partial credit, keys hidden before the reveal, role
+  checks, one game per session and per teacher, 500 players, slow sockets, idle
+  and room-close endings, spans, forget.
+- `tests/bank.rs` drives the REST router: tickets and roles, ownership (another
+  owner's quiz is 404), every limit, validation `fields`, whole-quiz saves, ETag
+  304, CORS preflight, compression, what the public listener does not serve.
+- `tests/game.rs` runs the real server on a port with websocket clients and a
+  fake LMS server: a three-question game with a host and players, reconnect,
+  origin / subprotocol / hello / ticket rules, socket, size and rate limits, and
+  spans (ordering, batches of 500, idempotency, retry after a 503, drop on a
+  404, shutdown flush, reconnect bridging).
+- `tests/ops.rs` moves the service clock to test expiry (kept vs not kept, use
+  moving it, viewing not, keeping switching 7 and 90 days, results expiring at 90
+  days while the quiz stays, the startup sweep), forget, the internal listener
+  and snapshots (atomic write, `unix-excl`, the gauge advancing when nothing
+  changed).
+
+## Benchmark
+
+`quiz-bench` plays a class against a running service over real sockets and
+reports the budgets the game is built for:
+
+```bash
+export QUIZ_TICKET_KEY=...        # the service's key
+ulimit -n 8192                    # a thousand sockets in each process
+./target/release/quiz-bench --url http://127.0.0.1:8080 --internal-url http://127.0.0.1:8081 \
+    --origin http://localhost:5173 --players 300 --questions 10 --pid <service pid>
+```
+
+A game takes at most 500 players, so more are spread over classes of 500 (each
+with its own host and game) playing at once. Measured on an arm64 Mac
+(10 cores, service and bench on the same machine, loopback, `QUIZ_WORKER_THREADS`
+at its default of 2), a typical question (80 characters, four options of 30):
+
+| | 300 players | 1,000 players (2 classes) | budget |
+|---|---:|---:|---:|
+| received per player per question | 421 B | 422 B | 1,024 B |
+| sent per player per question | 13 B | 13 B | 64 B |
+| frames received per player per question | 3 | 3 | |
+| whole class reached after a question opens (slowest) | 4.6 ms | 12.2 ms | 100 ms |
+| last answer to the reveal received everywhere (slowest) | 4.6 ms | 12.5 ms | |
+| memory per idle socket | 15.4 KiB | 11.9 KiB | 20 KiB |
+| idle RSS | 7.2 MiB | 7.2 MiB | 20 MiB |
+| question close (reveal and one write), mean | 13.0 ms | 43.6 ms | |
+| service CPU per question (whole class) | 33 ms | 132 ms | |
+| write conflicts retried | 0 | 11 | |
+
+A 120-character explanation adds about 120 B to what a player receives (539 B).
+Websocket permessage-deflate is not used: the websocket library the service
+builds on does not implement it, and a deflate context costs 32 KiB or more per
+socket (the whole budget is 20 KiB); on frames this size it would save about
+a quarter to two thirds of ~250 B, which is not needed to meet the budget.
+Encoding a question once instead of per socket costs 0.6 microseconds against
+0.6 ms for 1,000 sockets.
 
 ## License
 
