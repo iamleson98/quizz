@@ -153,12 +153,18 @@ curl -s $API/v1/quizzes/<id>/games -H "Authorization: Bearer $TEACHER"    # resu
 curl -s -X DELETE $API/v1/quizzes/<id> -H "Authorization: Bearer $TEACHER"
 ```
 
+Writes (`POST`, `PUT`, `DELETE`) are limited per person: a burst of 10, then 20 a
+minute, answered `429` with `RATE_LIMITED` and a `Retry-After` header; reading is
+not limited. One teacher's quizzes may hold 20 MB of text in all (titles,
+descriptions, questions, explanations and options): past that a save is `413`
+with `QUOTA_EXCEEDED`.
+
 A quiz is saved whole: `PUT` takes the title and the full question list. A
 question or option that carries the `id` it was read with keeps its identity
 (and the results recorded for it); one without an id is new; one left out is
 deleted. Errors use the real status and a body `{"code","message","fields"}`;
-`code` is `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `BAD_REQUEST`, `CONFLICT` or
-`INVALID` (422, with `fields: [{path, message}]` such as
+`code` is `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `BAD_REQUEST`, `CONFLICT`,
+`RATE_LIMITED` (429), `QUOTA_EXCEEDED` (413) or `INVALID` (422, with `fields: [{path, message}]` such as
 `questions[2].options[1].text`).
 
 The game, with the socket (Node 22 or later has `WebSocket` built in):
@@ -217,6 +223,7 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
 | `QUIZ_SNAPSHOT_INTERVAL_SECS` | `900` | time between snapshot attempts |
 | `QUIZ_LMS_URL` | `http://lms-server.lms.svc.cluster.local:8065` | the LMS server (plain http) that receives lesson-time spans; empty turns pushing off |
 | `QUIZ_WORKER_THREADS` | `2` | tokio worker threads: on its node the service shares cores with the SFU |
+| `QUIZ_BANK_WRITE_BURST` / `QUIZ_BANK_WRITES_PER_MINUTE` | `10` / `20` | writes to the bank (create, save, keep, delete) a person may make at once, and then per minute (429 with `Retry-After`) |
 | `QUIZ_WS_PING_SECS` / `QUIZ_WS_PONG_SECS` | `25` / `10` | websocket ping interval, and how long a peer has to answer it |
 | `QUIZ_POOL_MAX` / `QUIZ_POOL_MIN` | `4` / `2` | sqlx pool size (each connection has its own page cache) |
 | `QUIZ_BUSY_TIMEOUT_MS` | `5000` | per-connection busy timeout |

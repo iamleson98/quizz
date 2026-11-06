@@ -45,6 +45,14 @@ async fn load_quiz(state: &AppState, id: i64, owner: &str) -> AppResult<Quiz> {
     Ok(Quiz::new(&row, questions))
 }
 
+/// A write to the bank: at a human pace per person.
+fn limit_writes(state: &AppState, ticket: &crate::auth::Ticket) -> AppResult<()> {
+    state
+        .write_limiter
+        .take(&ticket.sub, std::time::Instant::now())
+        .map_err(AppError::RateLimited)
+}
+
 fn not_while_running(state: &AppState, id: i64) -> AppResult<()> {
     if state.rooms.running_quiz_ids().contains(&id) {
         return Err(AppError::Conflict("a game is running on this quiz".into()));
@@ -92,8 +100,10 @@ pub async fn list_quizzes(
         (status = 401, description = "No valid ticket", body = ErrorBody),
         (status = 403, description = "The ticket's role has no bank", body = ErrorBody),
         (status = 409, description = "The bank is full (200 quizzes)", body = ErrorBody),
-        (status = 413, description = "Body too large", body = ErrorBody),
+        (status = 413, description = "Body too large, or the quizzes would hold more than 20 MB of text (code QUOTA_EXCEEDED)", body = ErrorBody),
         (status = 422, description = "Invalid input; `fields` says where", body = ErrorBody),
+        (status = 429, description = "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            body = ErrorBody, headers(("Retry-After" = u64, description = "Seconds to wait"))),
     ),
     security(("bearer" = []))
 )]
@@ -103,6 +113,7 @@ pub async fn create_quiz(
     ApiJson(body): ApiJson<CreateQuizBody>,
 ) -> AppResult<(StatusCode, Json<Quiz>)> {
     ticket.require_bank()?;
+    limit_writes(&state, &ticket)?;
     let input = Arc::new(new_quiz(body.title, body.description, body.questions)?);
     let (owner, keep, now) = (ticket.sub.clone(), body.kept, state.now_ms());
     let id = tx::write_tx(&state, move |conn| {
@@ -166,8 +177,10 @@ pub async fn get_quiz(
         (status = 403, description = "The ticket's role has no bank", body = ErrorBody),
         (status = 404, description = "No such quiz of yours", body = ErrorBody),
         (status = 409, description = "A game is running on this quiz", body = ErrorBody),
-        (status = 413, description = "Body too large", body = ErrorBody),
+        (status = 413, description = "Body too large, or the quizzes would hold more than 20 MB of text (code QUOTA_EXCEEDED)", body = ErrorBody),
         (status = 422, description = "Invalid input; `fields` says where", body = ErrorBody),
+        (status = 429, description = "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            body = ErrorBody, headers(("Retry-After" = u64, description = "Seconds to wait"))),
     ),
     security(("bearer" = []))
 )]
@@ -178,6 +191,7 @@ pub async fn update_quiz(
     ApiJson(body): ApiJson<UpdateQuizBody>,
 ) -> AppResult<Json<Quiz>> {
     ticket.require_bank()?;
+    limit_writes(&state, &ticket)?;
     let id = quiz_id(&id)?;
     let input = Arc::new(new_quiz(body.title, body.description, body.questions)?);
     not_while_running(&state, id)?;
@@ -201,6 +215,8 @@ pub async fn update_quiz(
         (status = 401, description = "No valid ticket", body = ErrorBody),
         (status = 403, description = "The ticket's role has no bank", body = ErrorBody),
         (status = 404, description = "No such quiz of yours", body = ErrorBody),
+        (status = 429, description = "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            body = ErrorBody, headers(("Retry-After" = u64, description = "Seconds to wait"))),
     ),
     security(("bearer" = []))
 )]
@@ -211,6 +227,7 @@ pub async fn keep_quiz(
     ApiJson(body): ApiJson<KeptBody>,
 ) -> AppResult<Json<QuizSummary>> {
     ticket.require_bank()?;
+    limit_writes(&state, &ticket)?;
     let id = quiz_id(&id)?;
     let (owner, keep, now) = (ticket.sub.clone(), body.kept, state.now_ms());
     tx::write_tx(&state, move |conn| {
@@ -236,6 +253,8 @@ pub async fn keep_quiz(
         (status = 403, description = "The ticket's role has no bank", body = ErrorBody),
         (status = 404, description = "No such quiz of yours", body = ErrorBody),
         (status = 409, description = "A game is running on this quiz", body = ErrorBody),
+        (status = 429, description = "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            body = ErrorBody, headers(("Retry-After" = u64, description = "Seconds to wait"))),
     ),
     security(("bearer" = []))
 )]
@@ -245,6 +264,7 @@ pub async fn delete_quiz(
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
     ticket.require_bank()?;
+    limit_writes(&state, &ticket)?;
     let id = quiz_id(&id)?;
     not_while_running(&state, id)?;
     let owner = ticket.sub.clone();

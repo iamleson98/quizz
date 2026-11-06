@@ -160,7 +160,7 @@
             }
           },
           "413": {
-            "description": "Body too large",
+            "description": "Body too large, or the quizzes would hold more than 20 MB of text (code QUOTA_EXCEEDED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -171,6 +171,26 @@
           },
           "422": {
             "description": "Invalid input; `fields` says where",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -353,7 +373,7 @@
             }
           },
           "413": {
-            "description": "Body too large",
+            "description": "Body too large, or the quizzes would hold more than 20 MB of text (code QUOTA_EXCEEDED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -364,6 +384,26 @@
           },
           "422": {
             "description": "Invalid input; `fields` says where",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -432,6 +472,26 @@
           },
           "409": {
             "description": "A game is running on this quiz",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -596,6 +656,26 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Too many writes: 20 a minute after a burst of 10 per person (code RATE_LIMITED); wait the seconds in Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -646,7 +726,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "One of UNAUTHORIZED, FORBIDDEN, NOT_FOUND, BAD_REQUEST, CONFLICT,\nINVALID, INTERNAL."
+            "description": "One of UNAUTHORIZED, FORBIDDEN, NOT_FOUND, BAD_REQUEST, CONFLICT,\nINVALID, RATE_LIMITED (429), QUOTA_EXCEEDED (413), INTERNAL."
           },
           "fields": {
             "type": [

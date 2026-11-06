@@ -24,6 +24,8 @@ pub struct AppStateInner {
     /// Woken when the spans outbox has something new to push.
     pub spans_ready: Arc<Notify>,
     pub clock: Clock,
+    /// Limits the bank's writes per person.
+    pub write_limiter: crate::ratelimit::Limiter,
     /// SQLite version reported by our custom build (for /healthz).
     pub sqlite_version: String,
     pub started_at: std::time::Instant,
@@ -46,6 +48,8 @@ impl AppState {
     /// Connect, migrate, and build full application state.
     pub async fn connect(cfg: Config) -> crate::error::AppResult<Self> {
         let (pool, sqlite_version) = crate::db::connect_pool(&cfg).await?;
+        let write_limiter =
+            crate::ratelimit::Limiter::new(cfg.bank_write_burst, cfg.bank_writes_per_minute);
         let state = Self(Arc::new(AppStateInner {
             ticket_key: DecodingKey::from_secret(cfg.ticket_key.expose().as_bytes()),
             cfg,
@@ -55,6 +59,7 @@ impl AppState {
             deps: OnceLock::new(),
             spans_ready: Arc::new(Notify::new()),
             clock: Clock::default(),
+            write_limiter,
             sqlite_version,
             started_at: std::time::Instant::now(),
             commits: AtomicU64::new(0),

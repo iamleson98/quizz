@@ -17,6 +17,9 @@ CREATE TABLE quizzes (
     title      TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     kept       INTEGER NOT NULL,
+    -- bytes of text in the title, description, questions and options: the
+    -- owner's content budget is the sum of these
+    content_bytes INTEGER NOT NULL DEFAULT 0,
     -- last use + 90 days when kept, + 7 days when not (see retention.rs)
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,

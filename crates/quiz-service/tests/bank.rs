@@ -519,3 +519,116 @@ async fn the_public_listener_serves_only_the_bank_and_the_socket() {
     let post_forget = call(&router, "POST", "/internal/users/x/forget", None, None, &[]).await;
     assert_eq!(post_forget.status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn writes_are_rate_limited_per_person_with_a_retry_after() {
+    let state = setup_with(&[
+        ("QUIZ_BANK_WRITE_BURST", "3".into()),
+        ("QUIZ_BANK_WRITES_PER_MINUTE", "6".into()),
+    ])
+    .await;
+    let router = public_router(state.clone());
+    let t = ticket(&state, Role::Teacher, "teacher1");
+    let small = json!({ "title": "t", "questions": [ { "kind": "boolean", "text": "q",
+        "options": [ { "text": "a", "isCorrect": true }, { "text": "b", "isCorrect": false } ] } ] });
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let r = post(&router, "/v1/quizzes", &t, small.clone()).await;
+        assert_eq!(r.status, StatusCode::CREATED);
+        ids.push(r.body["id"].as_str().unwrap().to_string());
+    }
+    // the burst is spent: every kind of write is refused, with the seconds to wait
+    for r in [
+        post(&router, "/v1/quizzes", &t, small.clone()).await,
+        put(
+            &router,
+            &format!("/v1/quizzes/{}", ids[0]),
+            &t,
+            small.clone(),
+        )
+        .await,
+        put(
+            &router,
+            &format!("/v1/quizzes/{}/kept", ids[0]),
+            &t,
+            json!({"kept": false}),
+        )
+        .await,
+        delete(&router, &format!("/v1/quizzes/{}", ids[0]), &t).await,
+    ] {
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(r.body["code"], "RATE_LIMITED");
+        let wait: u64 = r.headers["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((1..=10).contains(&wait), "one token every 10 s: {wait}");
+    }
+    // reading is never limited, and somebody else is not affected
+    for _ in 0..20 {
+        assert_eq!(get(&router, "/v1/quizzes", &t).await.status, StatusCode::OK);
+    }
+    let other = ticket(&state, Role::Teacher, "teacher2");
+    assert_eq!(
+        post(&router, "/v1/quizzes", &other, small).await.status,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn an_owner_may_hold_20_mb_of_text_and_no_more() {
+    let state = setup().await;
+    let router = public_router(state.clone());
+    let t = ticket(&state, Role::Teacher, "teacher1");
+    // 100 questions of 500 + 6 x 200 + 500 characters: about 220 KB a quiz
+    let big = |title: &str| {
+        let options: Vec<Value> = (0..6)
+            .map(|i| json!({ "text": "o".repeat(200), "isCorrect": i == 0 }))
+            .collect();
+        let question = json!({ "kind": "single", "text": "q".repeat(500),
+            "explanation": "e".repeat(500), "options": options });
+        json!({ "title": title, "questions": vec![question; 100] })
+    };
+    let mut ids = Vec::new();
+    let mut refused = None;
+    for i in 0..100 {
+        let r = post(&router, "/v1/quizzes", &t, big(&format!("big {i}"))).await;
+        if r.status == StatusCode::CREATED {
+            ids.push(r.body["id"].as_str().unwrap().to_string());
+        } else {
+            refused = Some(r);
+            break;
+        }
+    }
+    let refused = refused.expect("the budget stopped it");
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(refused.body["code"], "QUOTA_EXCEEDED");
+    assert!(
+        (85..=95).contains(&ids.len()),
+        "about 20 MB / 220 KB = 91 quizzes: {}",
+        ids.len()
+    );
+
+    // another teacher has a budget of their own
+    let other = ticket(&state, Role::Teacher, "teacher2");
+    assert_eq!(
+        post(&router, "/v1/quizzes", &other, big("x")).await.status,
+        StatusCode::CREATED
+    );
+    // saving a quiz over itself costs nothing extra; growing it does not fit
+    let first = format!("/v1/quizzes/{}", ids[0]);
+    assert_eq!(
+        put(&router, &first, &t, big("renamed")).await.status,
+        StatusCode::OK
+    );
+    // deleting one frees its share
+    assert_eq!(
+        delete(&router, &format!("/v1/quizzes/{}", ids[1]), &t)
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post(&router, "/v1/quizzes", &t, big("fits again"))
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+}

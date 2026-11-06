@@ -90,6 +90,11 @@ pub struct Config {
     pub lms_url: Option<String>,
     /// Tokio worker threads: the node's SFU must keep its cores.
     pub worker_threads: usize,
+    /// Writes to the bank (create, save, keep, delete) a person may make at
+    /// once...
+    pub bank_write_burst: u32,
+    /// ...and then per minute.
+    pub bank_writes_per_minute: u32,
     /// Websocket ping interval (keeps proxies' idle limits away).
     pub ws_ping_every: Duration,
     /// How long a peer has to answer a ping before the socket is dropped.
@@ -232,6 +237,8 @@ impl Config {
             allowed_origins,
             lms_url,
             worker_threads,
+            bank_write_burst: num("QUIZ_BANK_WRITE_BURST", "10")?.max(1) as u32,
+            bank_writes_per_minute: num("QUIZ_BANK_WRITES_PER_MINUTE", "20")?.max(1) as u32,
             ws_ping_every: Duration::from_secs(num("QUIZ_WS_PING_SECS", "25")?.max(1)),
             ws_pong_within: Duration::from_secs(num("QUIZ_WS_PONG_SECS", "10")?.max(1)),
             pool_max,
@@ -315,6 +322,7 @@ mod tests {
             vec!["https://site.example".to_string()]
         );
         assert!(cfg.lms_url.unwrap().starts_with("http://lms-server"));
+        assert_eq!((cfg.bank_write_burst, cfg.bank_writes_per_minute), (10, 20));
     }
 
     #[test]

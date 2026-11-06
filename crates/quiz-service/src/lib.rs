@@ -12,6 +12,7 @@ pub mod grading;
 pub mod ids;
 pub mod model;
 pub mod push;
+pub mod ratelimit;
 pub mod repo;
 pub mod rest;
 pub mod retention;

@@ -37,6 +37,14 @@ pub enum AppError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// Too many writes too fast; try again in this many seconds.
+    #[error("too many requests: try again in {0} s")]
+    RateLimited(u64),
+
+    /// The owner's quizzes would hold more content than their budget.
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
+
     #[error("the input is not valid")]
     Invalid(Vec<FieldError>),
 
@@ -64,6 +72,8 @@ impl AppError {
             AppError::NotFound(_) => "NOT_FOUND",
             AppError::BadRequest(_) | AppError::TooLarge => "BAD_REQUEST",
             AppError::Conflict(_) => "CONFLICT",
+            AppError::RateLimited(_) => "RATE_LIMITED",
+            AppError::QuotaExceeded(_) => "QUOTA_EXCEEDED",
             AppError::Invalid(_) => "INVALID",
             AppError::Database(_)
             | AppError::Migrate(_)
@@ -80,6 +90,8 @@ impl AppError {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
+            AppError::QuotaExceeded(_) => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::TxExhausted(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Database(_) | AppError::Migrate(_) | AppError::Internal(_) => {
@@ -95,7 +107,8 @@ impl AppError {
             AppError::Forbidden => 2,
             AppError::NotFound(_) => 3,
             AppError::BadRequest(_) | AppError::TooLarge | AppError::Invalid(_) => 4,
-            AppError::Conflict(_) => 5,
+            AppError::Conflict(_) | AppError::QuotaExceeded(_) => 5,
+            AppError::RateLimited(_) => 6,
             _ => 9,
         }
     }
@@ -105,7 +118,7 @@ impl AppError {
 #[derive(Serialize, ToSchema)]
 pub struct ErrorBody {
     /// One of UNAUTHORIZED, FORBIDDEN, NOT_FOUND, BAD_REQUEST, CONFLICT,
-    /// INVALID, INTERNAL.
+    /// INVALID, RATE_LIMITED (429), QUOTA_EXCEEDED (413), INTERNAL.
     pub code: String,
     pub message: String,
     /// Present on INVALID: what is wrong and where.
@@ -127,6 +140,10 @@ impl IntoResponse for AppError {
             AppError::TxExhausted(_) => "the service is busy, try again".to_string(),
             other => other.to_string(),
         };
+        let retry_after = match &self {
+            AppError::RateLimited(secs) => Some(*secs),
+            _ => None,
+        };
         let body = ErrorBody {
             code: self.code().into(),
             message,
@@ -135,7 +152,13 @@ impl IntoResponse for AppError {
                 _ => None,
             },
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(secs) = retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
+        response
     }
 }
 

@@ -26,6 +26,8 @@ pub mod limits {
     pub const MAX_TIME_LIMIT_SEC: i64 = 120;
     pub const DEFAULT_TIME_LIMIT_SEC: i64 = 20;
     pub const MAX_PLAYERS_PER_GAME: usize = 500;
+    /// The text one teacher's quizzes may hold in all (20 MB).
+    pub const MAX_OWNER_BYTES: i64 = 20 * 1024 * 1024;
 }
 
 const QUIZ_COLS: &str =
@@ -163,6 +165,45 @@ fn validate_question(at: &str, q: &NewQuestion, errs: &mut Vec<FieldError>) {
     }
 }
 
+/// Bytes of text a quiz holds: its title and description, and every
+/// question, explanation and option.
+pub fn content_bytes(input: &NewQuiz) -> i64 {
+    let questions: usize = input
+        .questions
+        .iter()
+        .map(|q| {
+            q.text.trim().len()
+                + q.explanation.as_deref().map_or(0, |e| e.trim().len())
+                + q.options.iter().map(|o| o.text.trim().len()).sum::<usize>()
+        })
+        .sum();
+    (input.title.trim().len() + input.description.trim().len() + questions) as i64
+}
+
+/// Refuse a quiz that would take the owner past their content budget.
+/// `except` is the quiz being replaced, whose old size is free again.
+async fn check_budget(
+    conn: &mut SqliteConnection,
+    owner_id: &str,
+    except: Option<i64>,
+    bytes: i64,
+) -> AppResult<()> {
+    let used: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(content_bytes), 0) FROM quizzes WHERE owner_id = ?1 AND id != ?2",
+    )
+    .bind(owner_id)
+    .bind(except.unwrap_or(0))
+    .fetch_one(&mut *conn)
+    .await?;
+    if used + bytes > limits::MAX_OWNER_BYTES {
+        return Err(AppError::QuotaExceeded(format!(
+            "your quizzes may hold {} MB of text in all",
+            limits::MAX_OWNER_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
 fn trimmed(s: &str) -> &str {
     s.trim()
 }
@@ -193,10 +234,12 @@ pub async fn create(
             limits::MAX_QUIZZES_PER_OWNER
         )));
     }
+    let bytes = content_bytes(input);
+    check_budget(conn, owner_id, None, bytes).await?;
     let quiz_id = new_id();
     sqlx::query(
-        "INSERT INTO quizzes (id, owner_id, title, description, kept, expires_at, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?7, ?4, ?5, ?6, ?6)",
+        "INSERT INTO quizzes (id, owner_id, title, description, kept, expires_at, created_at, updated_at, content_bytes)
+         VALUES (?1, ?2, ?3, ?7, ?4, ?5, ?6, ?6, ?8)",
     )
     .bind(quiz_id)
     .bind(owner_id)
@@ -205,6 +248,7 @@ pub async fn create(
     .bind(quiz_expiry(keep, now))
     .bind(now)
     .bind(trimmed(&input.description))
+    .bind(bytes)
     .execute(&mut *conn)
     .await?;
     for (i, q) in input.questions.iter().enumerate() {
@@ -276,14 +320,17 @@ pub async fn update(
 ) -> AppResult<()> {
     validate(input)?;
     let quiz = owned(&mut *conn, quiz_id, owner_id).await?;
+    let bytes = content_bytes(input);
+    check_budget(conn, owner_id, Some(quiz_id), bytes).await?;
     sqlx::query(
-        "UPDATE quizzes SET title = ?2, description = ?5, expires_at = ?3, updated_at = ?4 WHERE id = ?1",
+        "UPDATE quizzes SET title = ?2, description = ?5, expires_at = ?3, updated_at = ?4, content_bytes = ?6 WHERE id = ?1",
     )
     .bind(quiz_id)
     .bind(trimmed(&input.title))
     .bind(quiz_expiry(quiz.kept, now))
     .bind(now)
     .bind(trimmed(&input.description))
+    .bind(bytes)
     .execute(&mut *conn)
     .await?;
 
@@ -556,6 +603,21 @@ mod tests {
             description: String::new(),
             questions,
         }
+    }
+
+    #[test]
+    fn content_is_counted_in_bytes_of_text() {
+        let q = quiz(vec![NewQuestion {
+            explanation: Some(" because ".into()),
+            ..question(QuestionKind::Single, &[true, false])
+        }]);
+        // title "T" + question "What?" + explanation "because" + options "o" "o"
+        assert_eq!(content_bytes(&q), 1 + 5 + 7 + 2);
+        let wide = quiz(vec![NewQuestion {
+            text: "\u{1F600}".repeat(100),
+            ..question(QuestionKind::Single, &[true, false])
+        }]);
+        assert_eq!(content_bytes(&wide), 1 + 400 + 2);
     }
 
     #[test]
