@@ -18,16 +18,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-const BASE: i64 = 1_800_000_000_000;
-const ROOM_CLOSES: i64 = BASE + 2 * 60 * 60 * 1000;
+pub(crate) const BASE: i64 = 1_800_000_000_000;
+pub(crate) const ROOM_CLOSES: i64 = BASE + 2 * 60 * 60 * 1000;
 
 #[derive(Default)]
-struct FakeStore {
-    quizzes: Mutex<HashMap<(i64, String), LoadedQuiz>>,
-    games: Mutex<Vec<NewGame>>,
-    batches: Mutex<Vec<Batch>>,
-    spans: Mutex<Vec<Span>>,
-    fail_writes: Mutex<bool>,
+pub(crate) struct FakeStore {
+    pub(crate) quizzes: Mutex<HashMap<(i64, String), LoadedQuiz>>,
+    pub(crate) games: Mutex<Vec<NewGame>>,
+    pub(crate) batches: Mutex<Vec<Batch>>,
+    pub(crate) spans: Mutex<Vec<Span>>,
+    pub(crate) fail_writes: Mutex<bool>,
 }
 
 impl GameStore for FakeStore {
@@ -88,12 +88,18 @@ fn quiz() -> LoadedQuiz {
     }
 }
 
-struct World {
-    store: Arc<FakeStore>,
-    deps: Deps,
+pub(crate) struct World {
+    pub(crate) store: Arc<FakeStore>,
+    pub(crate) deps: Deps,
 }
 
-fn world() -> World {
+pub(crate) fn world() -> World {
+    world_with(Arc::new(|| Box::new(super::quest::chest::SeededDraw(1))))
+}
+
+pub(crate) fn world_with(
+    quest_draw: Arc<dyn Fn() -> Box<dyn super::quest::chest::Draw> + Send + Sync>,
+) -> World {
     let store = Arc::new(FakeStore::default());
     store
         .quizzes
@@ -105,23 +111,24 @@ fn world() -> World {
         now_ms: Arc::new(|| BASE),
         rooms: Rooms::default(),
         track_spans: true,
+        quest_draw,
     };
     World { store, deps }
 }
 
-struct Client {
-    sock: u64,
-    room: RoomHandle,
-    rx: mpsc::Receiver<Out>,
+pub(crate) struct Client {
+    pub(crate) sock: u64,
+    pub(crate) room: RoomHandle,
+    pub(crate) rx: mpsc::Receiver<Out>,
 }
 
 impl Client {
-    async fn send(&self, frame: ClientFrame) {
+    pub(crate) async fn send(&self, frame: ClientFrame) {
         self.room.frame(self.sock, frame).await;
     }
 
     /// Frames waiting now, as JSON.
-    fn frames(&mut self) -> Vec<Value> {
+    pub(crate) fn frames(&mut self) -> Vec<Value> {
         let mut out = Vec::new();
         while let Ok(o) = self.rx.try_recv() {
             if let Some(t) = o.into_text() {
@@ -133,7 +140,7 @@ impl Client {
 }
 
 /// Move virtual time forward, then let every task run.
-async fn adv(d: Duration) {
+pub(crate) async fn adv(d: Duration) {
     tokio::time::advance(d).await;
     settle().await;
 }
@@ -144,15 +151,15 @@ async fn beat() {
 }
 
 /// Let every task run: advances a millisecond of virtual time.
-async fn settle() {
+pub(crate) async fn settle() {
     tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
-async fn connect(w: &World, sid: &str, user: &str, role: Role) -> Client {
+pub(crate) async fn connect(w: &World, sid: &str, user: &str, role: Role) -> Client {
     try_connect(w, sid, user, role).await.expect("attached")
 }
 
-async fn try_connect(w: &World, sid: &str, user: &str, role: Role) -> AppResult<Client> {
+pub(crate) async fn try_connect(w: &World, sid: &str, user: &str, role: Role) -> AppResult<Client> {
     let (out, rx) = super::registry::out_channel();
     let sock = w.deps.rooms.next_sock_id();
     let member = Member {
@@ -169,15 +176,15 @@ async fn try_connect(w: &World, sid: &str, user: &str, role: Role) -> AppResult<
     Ok(Client { sock, room, rx })
 }
 
-async fn host(w: &World) -> Client {
+pub(crate) async fn host(w: &World) -> Client {
     connect(w, "s1", "teacher", Role::Host).await
 }
 
-async fn player(w: &World, n: usize) -> Client {
+pub(crate) async fn player(w: &World, n: usize) -> Client {
     connect(w, "s1", &format!("p{n}"), Role::Player).await
 }
 
-fn kind(frame: &Value) -> u64 {
+pub(crate) fn kind(frame: &Value) -> u64 {
     frame[0].as_u64().unwrap()
 }
 
@@ -186,11 +193,11 @@ fn head4(f: &Value) -> Value {
     Value::Array(f.as_array().unwrap()[..4].to_vec())
 }
 
-fn last_of(frames: &[Value], k: u64) -> Option<&Value> {
+pub(crate) fn last_of(frames: &[Value], k: u64) -> Option<&Value> {
     frames.iter().rev().find(|f| kind(f) == k)
 }
 
-async fn answer(c: &Client, q: u32, mask: u32) {
+pub(crate) async fn answer(c: &Client, q: u32, mask: u32) {
     c.send(ClientFrame::Answer { q, mask }).await;
 }
 

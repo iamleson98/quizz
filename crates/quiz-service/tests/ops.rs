@@ -60,6 +60,7 @@ async fn play_game(state: &AppState, quiz: &Value, host: &str) -> i64 {
             class_id: "c1".into(),
             host_id: host.into(),
             started_at: now,
+            mode: 0,
         })
         .await
         .unwrap();
@@ -72,6 +73,8 @@ async fn play_game(state: &AppState, quiz: &Value, host: &str) -> i64 {
         score,
         total_ms: 4000,
         correct_count: 1,
+        answered: 1,
+        best_streak: 1,
     };
     let answer = |player_id, points| AnswerWrite {
         id: quiz_service::ids::new_id(),
@@ -232,6 +235,7 @@ async fn keeping_switches_the_period_both_ways_and_starting_a_game_is_a_use() {
             class_id: "c".into(),
             host_id: "teacher1".into(),
             started_at: state.now_ms(),
+            mode: 0,
         })
         .await
         .unwrap();
@@ -335,6 +339,7 @@ async fn the_sweep_runs_at_startup_and_closes_games_the_last_process_left_runnin
             class_id: "c".into(),
             host_id: "teacher1".into(),
             started_at: state.now_ms(),
+            mode: 0,
         })
         .await
         .unwrap();

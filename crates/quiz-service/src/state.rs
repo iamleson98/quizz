@@ -68,6 +68,7 @@ impl AppState {
             now_ms: Arc::new(move || clock_state.now_ms()),
             rooms: state.rooms.clone(),
             track_spans: state.cfg.lms_url.is_some(),
+            quest_draw: Arc::new(|| Box::new(crate::game::quest::chest::SystemDraw)),
         });
         Ok(state)
     }

@@ -46,7 +46,7 @@ impl Modify for Bearer {
         ErrorBody, FieldError, QuestionKind, dto::QuizSummary, dto::QuizList, dto::Quiz,
         dto::QuestionOut, dto::OptionOut, dto::QuestionIn, dto::OptionIn, dto::CreateQuizBody,
         dto::UpdateQuizBody, dto::KeptBody, dto::GameResult, dto::PlayerResult,
-        dto::QuestionResult,
+        dto::QuestionResult, dto::GameMode,
     )),
     modifiers(&Bearer),
     tags((name = "quizzes", description = "The teacher's quiz bank"))

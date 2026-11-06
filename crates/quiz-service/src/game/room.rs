@@ -107,15 +107,15 @@ impl RoomHandle {
     }
 }
 
-struct Sock {
-    user: String,
-    name: String,
-    role: Role,
-    cid: String,
-    rc: i64,
-    out: mpsc::Sender<Out>,
+pub(super) struct Sock {
+    pub(super) user: String,
+    pub(super) name: String,
+    pub(super) role: Role,
+    pub(super) cid: String,
+    pub(super) rc: i64,
+    pub(super) out: mpsc::Sender<Out>,
     /// Index into the game's players, for a player socket in a game.
-    pid: Option<usize>,
+    pub(super) pid: Option<usize>,
 }
 
 impl Drop for Sock {
@@ -163,6 +163,10 @@ struct Player {
     correct_count: i64,
     /// Fully right answers in a row, as of the last reveal.
     streak: u32,
+    /// The longest streak this game.
+    best_streak: u32,
+    /// Questions answered.
+    answered: u32,
     /// Sockets of this player attached now.
     live: u32,
     /// In the roster (a lobby player who left is not).
@@ -254,20 +258,22 @@ impl Game {
 
 /// Run a room until it has no sockets and no game left.
 pub struct Room {
-    sid: String,
-    id: u64,
-    deps: Deps,
-    socks: HashMap<u64, Sock>,
+    pub(super) sid: String,
+    pub(super) id: u64,
+    pub(super) deps: Deps,
+    pub(super) socks: HashMap<u64, Sock>,
     game: Option<Game>,
-    spans: SpanBook,
-    wall0: i64,
-    t0: Instant,
+    /// The quest game, when this room plays one instead of a race.
+    pub(super) quest: Option<super::quest::Quest>,
+    pub(super) spans: SpanBook,
+    pub(super) wall0: i64,
+    pub(super) t0: Instant,
     /// Sockets to drop after the current command (too slow or gone).
-    slow: Vec<u64>,
-    progress_dirty: bool,
-    count_dirty: bool,
-    flush_at: Option<Instant>,
-    last_flush: Instant,
+    pub(super) slow: Vec<u64>,
+    pub(super) progress_dirty: bool,
+    pub(super) count_dirty: bool,
+    pub(super) flush_at: Option<Instant>,
+    pub(super) last_flush: Instant,
 }
 
 /// Start the room task for session `sid`.
@@ -281,6 +287,7 @@ pub fn spawn(deps: Deps, sid: String, id: u64) -> RoomHandle {
         deps,
         socks: HashMap::new(),
         game: None,
+        quest: None,
         spans: SpanBook::default(),
         t0: now,
         slow: Vec::new(),
@@ -301,11 +308,11 @@ async fn sleep_until_opt(t: Option<Instant>) {
 }
 
 impl Room {
-    fn wall(&self, at: Instant) -> i64 {
+    pub(super) fn wall(&self, at: Instant) -> i64 {
         self.wall0 + at.saturating_duration_since(self.t0).as_millis() as i64
     }
 
-    fn now_wall(&self) -> i64 {
+    pub(super) fn now_wall(&self) -> i64 {
         self.wall(Instant::now())
     }
 
@@ -322,7 +329,7 @@ impl Room {
                 _ = sleep_until_opt(wake) => self.on_timer().await,
             }
             self.reap().await;
-            if self.socks.is_empty() && self.game.is_none() {
+            if self.socks.is_empty() && self.game.is_none() && self.quest.is_none() {
                 break;
             }
         }
@@ -343,6 +350,7 @@ impl Room {
             g.map(|g| g.idle_at),
             self.flush_at,
             g.map(|_| self.spans.next_tick),
+            self.quest_next_wake(),
         ]
         .into_iter()
         .flatten()
@@ -379,6 +387,7 @@ impl Room {
             let due = self.spans.tick(self.wall(now), now);
             self.write_spans(due).await;
         }
+        self.quest_on_timer().await;
     }
 
     /// Handle one command; true when the room must stop now.
@@ -395,7 +404,7 @@ impl Room {
                 let _ = reply.send(());
             }
             Cmd::Shutdown(reply) => {
-                if self.game.is_some() {
+                if self.game.is_some() || self.quest.is_some() {
                     self.finish(EndReason::Restart).await;
                 }
                 for s in self.socks.values() {
@@ -411,7 +420,7 @@ impl Room {
 
     // ----------------------------------------------------------- sending
 
-    fn push(&mut self, sock: u64, out: Out) {
+    pub(super) fn push(&mut self, sock: u64, out: Out) {
         if let Some(s) = self.socks.get(&sock)
             && s.out.try_send(out).is_err()
         {
@@ -432,11 +441,11 @@ impl Room {
         self.slow.extend(slow);
     }
 
-    fn broadcast_shared(&mut self, frame: Utf8Bytes) {
+    pub(super) fn broadcast_shared(&mut self, frame: Utf8Bytes) {
         self.broadcast(|_, _| Some(Out::Plain(frame.clone())));
     }
 
-    fn broadcast_hosts(&mut self, frame: Utf8Bytes) {
+    pub(super) fn broadcast_hosts(&mut self, frame: Utf8Bytes) {
         self.broadcast(|s, _| (s.role == Role::Host).then(|| Out::Plain(frame.clone())));
     }
 
@@ -455,6 +464,9 @@ impl Room {
     fn attach(&mut self, m: Member) -> AppResult<()> {
         if m.role == Role::Teacher {
             return Err(AppError::Forbidden);
+        }
+        if self.quest.is_some() {
+            return self.quest_attach(m);
         }
         let now = Instant::now();
         let wall = self.wall(now);
@@ -493,7 +505,10 @@ impl Room {
         Ok(())
     }
 
-    async fn detach(&mut self, sock: u64) {
+    pub(super) async fn detach(&mut self, sock: u64) {
+        if self.quest.is_some() {
+            return self.quest_detach(sock).await;
+        }
         let Some(s) = self.socks.remove(&sock) else {
             return;
         };
@@ -530,6 +545,9 @@ impl Room {
     }
 
     async fn forget(&mut self, user: &str) {
+        if self.quest.is_some() {
+            return self.quest_forget(user).await;
+        }
         if self.game.as_ref().is_some_and(|g| g.host == user) {
             self.finish(EndReason::Host).await;
         }
@@ -568,10 +586,30 @@ impl Room {
             ClientFrame::Next => frames::client::NEXT,
             ClientFrame::End => frames::client::END,
             ClientFrame::Answer { .. } => frames::client::ANSWER,
+            ClientFrame::StartQuest { .. } => frames::client::START,
+            ClientFrame::Character(_) => frames::client::CHARACTER,
+            ClientFrame::QuestAnswer { .. } => frames::client::QUEST_ANSWER,
+            ClientFrame::QuestPick { .. } => frames::client::QUEST_PICK,
+            ClientFrame::QuestNext => frames::client::QUEST_NEXT,
         };
         let res = match frame {
             ClientFrame::Hello(_) => Err(AppError::BadRequest("already said hello".into())),
-            ClientFrame::Start(quiz_id) => self.start(sock, role, &user, quiz_id).await,
+            ClientFrame::Start(quiz_id) => self.start(sock, role, &user, quiz_id, None).await,
+            ClientFrame::StartQuest {
+                quiz_id,
+                seconds,
+                flags,
+            } => {
+                self.start(sock, role, &user, quiz_id, Some((seconds, flags)))
+                    .await
+            }
+            // while a quest game exists, the host's next/end and the
+            // players' frames are the quest's
+            frame if self.quest.is_some() => self.quest_frame(sock, role, &user, frame).await,
+            ClientFrame::Character(_)
+            | ClientFrame::QuestAnswer { .. }
+            | ClientFrame::QuestPick { .. }
+            | ClientFrame::QuestNext => Err(AppError::Conflict("there is no quest game".into())),
             ClientFrame::Next => self.next(role, &user).await,
             ClientFrame::End => self.end(role, &user).await,
             ClientFrame::Answer { q, mask } => self.answer(sock, role, q, mask).await,
@@ -599,11 +637,19 @@ impl Room {
         }
     }
 
-    async fn start(&mut self, sock: u64, role: Role, user: &str, quiz_id: i64) -> AppResult<()> {
+    /// `quest` is `(seconds, flags)` for a quest game, `None` for a race.
+    async fn start(
+        &mut self,
+        sock: u64,
+        role: Role,
+        user: &str,
+        quiz_id: i64,
+        quest: Option<(u32, u32)>,
+    ) -> AppResult<()> {
         if role != Role::Host {
             return Err(AppError::Forbidden);
         }
-        if self.game.is_some() {
+        if self.game.is_some() || self.quest.is_some() {
             return Err(AppError::Conflict("a game is already running here".into()));
         }
         let (rc, cid) = self
@@ -615,7 +661,14 @@ impl Room {
             return Err(AppError::Conflict("the room is closed".into()));
         }
         self.deps.rooms.try_begin(&self.sid, user, quiz_id)?;
-        match self.open_lobby(user, quiz_id, &cid, rc).await {
+        let opened = match quest {
+            None => self.open_lobby(user, quiz_id, &cid, rc).await,
+            Some((seconds, flags)) => {
+                self.open_quest_lobby(user, quiz_id, &cid, rc, seconds, flags)
+                    .await
+            }
+        };
+        match opened {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.deps.rooms.game_ended(&self.sid);
@@ -641,6 +694,7 @@ impl Room {
                 class_id: cid.to_string(),
                 host_id: host.to_string(),
                 started_at: wall,
+                mode: 0,
             })
             .await?;
         let rc_at = now + Duration::from_millis((rc - wall).max(0) as u64);
@@ -732,6 +786,8 @@ fn join(g: &mut Game, user: &str, name: &str, wall: i64) -> AppResult<usize> {
         total_ms: 0,
         correct_count: 0,
         streak: 0,
+        best_streak: 0,
+        answered: 0,
         live: 1,
         active: true,
         dirty: true,
@@ -822,7 +878,7 @@ impl Room {
 
     // ----------------------------------------------------- throttled counts
 
-    fn mark_count_dirty(&mut self) {
+    pub(super) fn mark_count_dirty(&mut self) {
         self.count_dirty = true;
         self.schedule_flush();
     }
@@ -833,7 +889,7 @@ impl Room {
     }
 
     /// Send the pending count updates now, or at the end of the 500 ms.
-    fn schedule_flush(&mut self) {
+    pub(super) fn schedule_flush(&mut self) {
         let due = self.last_flush + PROGRESS_EVERY;
         if due <= Instant::now() {
             self.flush();
@@ -843,6 +899,9 @@ impl Room {
     }
 
     fn flush(&mut self) {
+        if self.quest.is_some() {
+            return self.quest_flush();
+        }
         self.flush_at = None;
         self.last_flush = Instant::now();
         let (progress, count) = (self.progress_dirty, self.count_dirty);
@@ -1055,6 +1114,8 @@ impl Room {
             // partly right one ends it. The points and the bonus were
             // settled when the answer arrived.
             p.streak = if a.correct { p.streak + 1 } else { 0 };
+            p.best_streak = p.best_streak.max(p.streak);
+            p.answered += 1;
             p.score += a.points;
             p.total_ms += a.time_ms;
             p.correct_count += a.correct as i64;
@@ -1121,7 +1182,10 @@ impl Room {
 
     /// End the game: write everything that is left, close the spans, tell
     /// everyone. The sockets stay: the room can host another game.
-    async fn finish(&mut self, reason: EndReason) {
+    pub(super) async fn finish(&mut self, reason: EndReason) {
+        if self.quest.is_some() {
+            return self.quest_finish(reason).await;
+        }
         if self.game.is_none() {
             return;
         }
@@ -1163,6 +1227,8 @@ impl Room {
                 score: p.score,
                 total_ms: p.total_ms,
                 correct_count: p.correct_count,
+                answered: i64::from(p.answered),
+                best_streak: i64::from(p.best_streak),
             })
             .collect();
         let written: Vec<i64> = players.iter().map(|p| p.id).collect();
@@ -1192,7 +1258,7 @@ impl Room {
         }
     }
 
-    async fn write_spans(&self, spans: Vec<Span>) {
+    pub(super) async fn write_spans(&self, spans: Vec<Span>) {
         if spans.is_empty() {
             return;
         }

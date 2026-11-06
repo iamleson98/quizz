@@ -15,6 +15,8 @@ pub struct NewGame {
     pub class_id: String,
     pub host_id: String,
     pub started_at: i64,
+    /// 0 for a race, 1 for a quest.
+    pub mode: i64,
 }
 
 /// One player's totals, upserted by id.
@@ -28,6 +30,8 @@ pub struct PlayerWrite {
     pub score: i64,
     pub total_ms: i64,
     pub correct_count: i64,
+    pub answered: i64,
+    pub best_streak: i64,
 }
 
 /// One answer, written when its question closes.
@@ -71,8 +75,8 @@ pub async fn start(conn: &mut SqliteConnection, game: &NewGame) -> AppResult<()>
         return Err(AppError::NotFound("quiz".into()));
     }
     sqlx::query(
-        "INSERT INTO games (id, quiz_id, session_id, class_id, host_id, started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO games (id, quiz_id, session_id, class_id, host_id, started_at, mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(game.id)
     .bind(game.quiz_id)
@@ -80,6 +84,7 @@ pub async fn start(conn: &mut SqliteConnection, game: &NewGame) -> AppResult<()>
     .bind(&game.class_id)
     .bind(&game.host_id)
     .bind(game.started_at)
+    .bind(game.mode)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -89,11 +94,12 @@ pub async fn start(conn: &mut SqliteConnection, game: &NewGame) -> AppResult<()>
 pub async fn write_batch(conn: &mut SqliteConnection, batch: &Batch) -> AppResult<()> {
     for p in &batch.players {
         sqlx::query(
-            "INSERT INTO players (id, game_id, user_id, name, joined_at, score, total_ms, correct_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO players (id, game_id, user_id, name, joined_at, score, total_ms, correct_count, answered, best_streak)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                 user_id = excluded.user_id, name = excluded.name, score = excluded.score,
-                total_ms = excluded.total_ms, correct_count = excluded.correct_count",
+                total_ms = excluded.total_ms, correct_count = excluded.correct_count,
+                answered = excluded.answered, best_streak = excluded.best_streak",
         )
         .bind(p.id)
         .bind(batch.game_id)
@@ -103,6 +109,8 @@ pub async fn write_batch(conn: &mut SqliteConnection, batch: &Batch) -> AppResul
         .bind(p.score)
         .bind(p.total_ms)
         .bind(p.correct_count)
+        .bind(p.answered)
+        .bind(p.best_streak)
         .execute(&mut *conn)
         .await?;
     }
@@ -144,6 +152,7 @@ pub struct PlayerResult {
     pub total_ms: i64,
     pub correct_count: i64,
     pub answered_count: i64,
+    pub best_streak: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -161,12 +170,14 @@ pub struct GameResult {
     pub started_at: i64,
     pub ended_at: i64,
     pub expires_at: i64,
+    /// 0 race, 1 quest.
+    pub mode: i64,
     pub players: Vec<PlayerResult>,
     pub questions: Vec<QuestionResult>,
 }
 
-/// `game_id, user_id, name, score, total_ms, correct_count, answered_count`
-type PlayerRow = (i64, Option<String>, String, i64, i64, i64, i64);
+/// `game_id, user_id, name, score, total_ms, correct_count, answered, best_streak`
+type PlayerRow = (i64, Option<String>, String, i64, i64, i64, i64, i64);
 
 /// Most recent ended games of a quiz returned by [`results`].
 const MAX_RESULTS: i64 = 100;
@@ -176,8 +187,8 @@ pub async fn results<'e, E>(exec: E, quiz_id: i64) -> AppResult<Vec<GameResult>>
 where
     E: 'e + Send + Clone + Executor<'e, Database = Sqlite>,
 {
-    let games: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
-        "SELECT id, started_at, ended_at, expires_at FROM games
+    let games: Vec<(i64, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, started_at, ended_at, expires_at, mode FROM games
          WHERE quiz_id = ?1 AND ended_at IS NOT NULL
          ORDER BY started_at DESC, id DESC LIMIT ?2",
     )
@@ -191,7 +202,7 @@ where
 
     let players: Vec<PlayerRow> = sqlx::query_as(
         "SELECT p.game_id, p.user_id, p.name, p.score, p.total_ms, p.correct_count,
-                (SELECT COUNT(*) FROM answers a WHERE a.player_id = p.id)
+                p.answered, p.best_streak
          FROM players p JOIN games g ON g.id = p.game_id
          WHERE g.quiz_id = ?1
          ORDER BY p.game_id, p.score DESC, p.total_ms ASC, p.joined_at ASC, p.id",
@@ -200,7 +211,9 @@ where
     .fetch_all(exec.clone())
     .await?;
     let mut players_by_game: HashMap<i64, Vec<PlayerResult>> = HashMap::new();
-    for (game_id, user_id, name, score, total_ms, correct_count, answered_count) in players {
+    for (game_id, user_id, name, score, total_ms, correct_count, answered_count, best_streak) in
+        players
+    {
         let list = players_by_game.entry(game_id).or_default();
         let rank = list.len() as i64 + 1;
         list.push(PlayerResult {
@@ -211,6 +224,7 @@ where
             total_ms,
             correct_count,
             answered_count,
+            best_streak,
         });
     }
 
@@ -235,14 +249,17 @@ where
 
     Ok(games
         .into_iter()
-        .map(|(id, started_at, ended_at, expires_at)| GameResult {
+        .map(|(id, started_at, ended_at, expires_at, mode)| GameResult {
             id,
             started_at,
             ended_at,
             expires_at,
+            mode,
             players: players_by_game.remove(&id).unwrap_or_default(),
+            // a quest keeps no per-question results: nobody shares a question
             questions: questions
                 .iter()
+                .filter(|_| mode == 0)
                 .map(|(qid, position, text)| {
                     let (answered_count, correct_count) =
                         stats.get(&(id, *qid)).copied().unwrap_or((0, 0));

@@ -193,6 +193,18 @@ pub struct PlayerResult {
     pub total_ms: i64,
     pub correct_count: i64,
     pub answered_count: i64,
+    /// The most answers in a row that were fully right.
+    pub best_streak: i64,
+}
+
+/// The kind of game that was played.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GameMode {
+    /// Class-paced: everyone gets each question together.
+    Race,
+    /// Self-paced, with coins, chests and steals; the score is coins.
+    Quest,
 }
 
 /// How a question went in a finished game.
@@ -215,6 +227,7 @@ pub struct GameResult {
     pub ended_at: i64,
     /// When the results are deleted (90 days after the game ended).
     pub expires_at: i64,
+    pub mode: GameMode,
     /// Best first.
     pub players: Vec<PlayerResult>,
     pub questions: Vec<QuestionResult>,
@@ -227,6 +240,11 @@ impl From<GameResultRow> for GameResult {
             started_at: g.started_at,
             ended_at: g.ended_at,
             expires_at: g.expires_at,
+            mode: if g.mode == 1 {
+                GameMode::Quest
+            } else {
+                GameMode::Race
+            },
             players: g
                 .players
                 .into_iter()
@@ -238,6 +256,7 @@ impl From<GameResultRow> for GameResult {
                     total_ms: p.total_ms,
                     correct_count: p.correct_count,
                     answered_count: p.answered_count,
+                    best_streak: p.best_streak,
                 })
                 .collect(),
             questions: g

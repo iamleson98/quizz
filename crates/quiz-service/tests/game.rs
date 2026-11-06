@@ -801,3 +801,81 @@ async fn the_host_sees_names_and_selections_and_players_see_neither() {
     }
     send(&mut host, json!([3])).await;
 }
+
+#[tokio::test]
+async fn a_quest_game_over_real_sockets_from_start_to_stored_results() {
+    let s = serve(&[]).await;
+    let quiz_id = s.quiz("teacher1").await;
+    let (mut host, _) = s.join(&host_ticket(&s, "teacher1")).await;
+    let (mut a, _) = s.join(&player_ticket(&s, "student1")).await;
+    let (mut b, _) = s.join(&player_ticket(&s, "student2")).await;
+
+    // a quest of 5 minutes, friendly
+    send(&mut host, json!([1, quiz_id, 1, 300, 1])).await;
+    let lobby = recv_kind(&mut a, 20).await;
+    assert_eq!(lobby[5], 300);
+    assert_eq!(lobby[6], 1, "friendly");
+    send(&mut a, json!([5, 4])).await; // a character
+    let roster = recv_kind(&mut host, 21).await;
+    assert!(!roster[1].as_array().unwrap().is_empty());
+
+    send(&mut host, json!([2])).await;
+    let running = recv_kind(&mut a, 22).await;
+    assert_eq!(
+        running[2].as_i64().unwrap() - running[1].as_i64().unwrap(),
+        300_000
+    );
+    let q = recv_kind(&mut a, 24).await;
+    let (kind, serial) = (q[1].as_u64().unwrap(), q[5].as_u64().unwrap());
+    assert_eq!(
+        q.as_array().unwrap().len(),
+        7,
+        "kind, text, options, limit, serial, time left"
+    );
+    // the quiz is single, multiple, true/false in order; the question text is
+    // the authored one, whatever the order this player got
+    let text = q[2].as_str().unwrap().to_string();
+    let mask = match text.as_str() {
+        "1/2 + 1/2 = ?" | "0.5 = 1/2" => 1,
+        "Which are prime?" => 0b0101,
+        other => panic!("unexpected question {other}"),
+    };
+    assert!(kind <= 2);
+    send(&mut a, json!([6, serial, mask])).await;
+    let verdict = recv_kind(&mut a, 25).await;
+    assert_eq!(verdict[2], 1, "right");
+    assert!(verdict[3].as_i64().unwrap() >= 10);
+    send(&mut a, json!([7, serial, 0])).await;
+    let chest = recv_kind(&mut a, 26).await;
+    assert_eq!(
+        chest[6].as_array().unwrap().len(),
+        6,
+        "the three outcomes are shown"
+    );
+    let next = recv_kind(&mut a, 24).await;
+    assert_eq!(next[5], 2, "the next question is serial 2");
+
+    // the other player never saw a's verdict or chest, and a wrong answer
+    // costs a pause
+    let q2 = recv_kind(&mut b, 24).await;
+    send(&mut b, json!([6, q2[5], 0b1000_0000u32])).await; // an impossible choice
+    assert_eq!(recv(&mut b).await, json!([8, 4, 6]));
+
+    send(&mut host, json!([3])).await;
+    assert_eq!(recv_kind(&mut a, 7).await, json!([7, 0]));
+
+    // the results are in the bank, as a quest
+    let t = ticket(&s.state, Role::Teacher, "teacher1");
+    let games = get(&s.router, &format!("/v1/quizzes/{quiz_id}/games"), &t)
+        .await
+        .body;
+    assert_eq!(games[0]["mode"], "quest");
+    let players = games[0]["players"].as_array().unwrap();
+    assert_eq!(players.len(), 2);
+    assert_eq!(players[0]["name"], "Name student1");
+    assert!(players[0]["score"].as_i64().unwrap() >= 10, "coins");
+    assert_eq!(players[0]["answeredCount"], 1);
+    assert_eq!(players[0]["correctCount"], 1);
+    assert_eq!(players[0]["bestStreak"], 1);
+    assert_eq!(games[0]["questions"], json!([]));
+}

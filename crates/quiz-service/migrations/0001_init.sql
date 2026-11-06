@@ -54,7 +54,9 @@ CREATE TABLE games (
     started_at INTEGER NOT NULL,
     ended_at   INTEGER,
     -- ended_at + 90 days; NULL while the game runs
-    expires_at INTEGER
+    expires_at INTEGER,
+    -- 0 race (class-paced), 1 quest (self-paced, coins)
+    mode       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_games_quiz   ON games(quiz_id, started_at DESC);
 CREATE INDEX idx_games_expiry ON games(expires_at) WHERE expires_at IS NOT NULL;
@@ -69,6 +71,8 @@ CREATE TABLE players (
     score         INTEGER NOT NULL DEFAULT 0,
     total_ms      INTEGER NOT NULL DEFAULT 0,
     correct_count INTEGER NOT NULL DEFAULT 0,
+    answered      INTEGER NOT NULL DEFAULT 0,
+    best_streak   INTEGER NOT NULL DEFAULT 0,
     UNIQUE (game_id, user_id)
 );
 CREATE INDEX idx_players_user ON players(user_id) WHERE user_id IS NOT NULL;

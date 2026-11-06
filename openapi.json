@@ -680,6 +680,14 @@
           }
         }
       },
+      "GameMode": {
+        "type": "string",
+        "description": "The kind of game that was played.",
+        "enum": [
+          "race",
+          "quest"
+        ]
+      },
       "GameResult": {
         "type": "object",
         "description": "A finished game's results.",
@@ -688,6 +696,7 @@
           "startedAt",
           "endedAt",
           "expiresAt",
+          "mode",
           "players",
           "questions"
         ],
@@ -703,6 +712,9 @@
           },
           "id": {
             "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/GameMode"
           },
           "players": {
             "type": "array",
@@ -786,7 +798,8 @@
           "score",
           "totalMs",
           "correctCount",
-          "answeredCount"
+          "answeredCount",
+          "bestStreak"
         ],
         "properties": {
           "anonymous": {
@@ -795,6 +808,11 @@
           "answeredCount": {
             "type": "integer",
             "format": "int64"
+          },
+          "bestStreak": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The most answers in a row that were fully right."
           },
           "correctCount": {
             "type": "integer",

@@ -17,6 +17,14 @@ pub mod client {
     pub const NEXT: u64 = 2;
     pub const END: u64 = 3;
     pub const ANSWER: u64 = 4;
+    /// Quest mode: choose a character.
+    pub const CHARACTER: u64 = 5;
+    /// Quest mode: answer the question just served.
+    pub const QUEST_ANSWER: u64 = 6;
+    /// Quest mode: pick a chest.
+    pub const QUEST_PICK: u64 = 7;
+    /// Quest mode: ask for the question again / the next one.
+    pub const QUEST_NEXT: u64 = 8;
 }
 
 /// Server to client frame types.
@@ -33,6 +41,17 @@ pub mod server {
     pub const ACK: u8 = 9;
     pub const NAMES: u8 = 10;
     pub const CLOSED: u8 = 11;
+    // Quest mode (see PROTOCOL.md): 20 and up, so nothing clashes with the race.
+    pub const QUEST_LOBBY: u8 = 20;
+    pub const QUEST_ROSTER: u8 = 21;
+    pub const QUEST_RUNNING: u8 = 22;
+    pub const QUEST_ME: u8 = 23;
+    pub const QUEST_QUESTION: u8 = 24;
+    pub const QUEST_VERDICT: u8 = 25;
+    pub const QUEST_CHEST: u8 = 26;
+    pub const QUEST_EVENT: u8 = 27;
+    pub const QUEST_STANDINGS: u8 = 28;
+    pub const QUEST_BOARD: u8 = 29;
 }
 
 /// Why a game ended (`ended` frame).
@@ -59,6 +78,27 @@ pub enum ClientFrame {
         q: u32,
         mask: u32,
     },
+    /// Host: open a lobby for a quest game of `seconds`; bit 0 of `flags` is
+    /// friendly mode (no steals).
+    StartQuest {
+        quiz_id: i64,
+        seconds: u32,
+        flags: u32,
+    },
+    /// Quest player: choose a character (0 to 11).
+    Character(u32),
+    /// Quest player: answer the question served with this serial.
+    QuestAnswer {
+        serial: u32,
+        mask: u32,
+    },
+    /// Quest player: pick chest 0, 1 or 2 for the verdict with this serial.
+    QuestPick {
+        serial: u32,
+        chest: u32,
+    },
+    /// Quest player: ask for the question again (or the next one).
+    QuestNext,
 }
 
 /// Parse a client text frame; `None` when it is not a well-formed frame.
@@ -70,6 +110,31 @@ pub fn parse_client(text: &str) -> Option<ClientFrame> {
     match (kind, items.len()) {
         (client::HELLO, 2) => Some(ClientFrame::Hello(items[1].as_str()?.to_string())),
         (client::START, 2) => Some(ClientFrame::Start(items[1].as_str()?.parse().ok()?)),
+        (client::START, 5) => {
+            let quiz_id = items[1].as_str()?.parse().ok()?;
+            let num = |i: usize| u32::try_from(items[i].as_u64()?).ok();
+            match items[2].as_u64()? {
+                0 => Some(ClientFrame::Start(quiz_id)),
+                1 => Some(ClientFrame::StartQuest {
+                    quiz_id,
+                    seconds: num(3)?,
+                    flags: num(4)?,
+                }),
+                _ => None,
+            }
+        }
+        (client::CHARACTER, 2) => Some(ClientFrame::Character(
+            u32::try_from(items[1].as_u64()?).ok()?,
+        )),
+        (client::QUEST_ANSWER, 3) => Some(ClientFrame::QuestAnswer {
+            serial: u32::try_from(items[1].as_u64()?).ok()?,
+            mask: u32::try_from(items[2].as_u64()?).ok()?,
+        }),
+        (client::QUEST_PICK, 3) => Some(ClientFrame::QuestPick {
+            serial: u32::try_from(items[1].as_u64()?).ok()?,
+            chest: u32::try_from(items[2].as_u64()?).ok()?,
+        }),
+        (client::QUEST_NEXT, 1) => Some(ClientFrame::QuestNext),
         (client::NEXT, 1) => Some(ClientFrame::Next),
         (client::END, 1) => Some(ClientFrame::End),
         (client::ANSWER, 3) => Some(ClientFrame::Answer {
@@ -111,6 +176,11 @@ pub enum Tail {
     },
     /// The podium: score and rank.
     Podium { score: i64, rank: u32 },
+    /// A quest question: its serial for this player and the thinking time
+    /// they have left in ms.
+    Serial { serial: u32, remaining_ms: i64 },
+    /// A quest standings strip: the player's own rank and coins.
+    Standing { rank: u32, coins: i64 },
 }
 
 impl Out {
@@ -137,6 +207,11 @@ impl Out {
                         correct as u8
                     ),
                     Tail::Podium { score, rank } => write!(s, ",{score},{rank}"),
+                    Tail::Serial {
+                        serial,
+                        remaining_ms,
+                    } => write!(s, ",{serial},{remaining_ms}"),
+                    Tail::Standing { rank, coins } => write!(s, ",{rank},{coins}"),
                 }
                 .ok()?;
                 s.push(']');
@@ -318,6 +393,49 @@ mod tests {
             parse_client("[4,2,5]"),
             Some(ClientFrame::Answer { q: 2, mask: 5 })
         );
+    }
+
+    #[test]
+    fn parses_the_start_forms_and_the_quest_frames() {
+        assert_eq!(
+            parse_client(r#"[1,"7",0,0,0]"#),
+            Some(ClientFrame::Start(7))
+        );
+        assert_eq!(
+            parse_client(r#"[1,"7",1,600,1]"#),
+            Some(ClientFrame::StartQuest {
+                quiz_id: 7,
+                seconds: 600,
+                flags: 1
+            })
+        );
+        assert_eq!(parse_client(r#"[1,"7",2,600,1]"#), None);
+        assert_eq!(parse_client("[5,3]"), Some(ClientFrame::Character(3)));
+        assert_eq!(
+            parse_client("[6,12,5]"),
+            Some(ClientFrame::QuestAnswer {
+                serial: 12,
+                mask: 5
+            })
+        );
+        assert_eq!(
+            parse_client("[7,12,2]"),
+            Some(ClientFrame::QuestPick {
+                serial: 12,
+                chest: 2
+            })
+        );
+        assert_eq!(parse_client("[8]"), Some(ClientFrame::QuestNext));
+        for bad in [
+            "[5]",
+            "[6,1]",
+            "[7,1]",
+            "[8,1]",
+            "[5,-1]",
+            "[1,\"7\",1,600]",
+        ] {
+            assert_eq!(parse_client(bad), None, "{bad}");
+        }
     }
 
     #[test]
