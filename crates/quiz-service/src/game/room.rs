@@ -41,7 +41,10 @@ pub const HOST_AWAY_LIMIT: Duration = Duration::from_secs(120);
 /// A running game with no socket at all for this long ends
 /// ([`EndReason::Idle`]), so the room is freed.
 pub const EMPTY_ROOM_LIMIT: Duration = Duration::from_secs(5 * 60);
-/// Frames a socket may have waiting before it is cut as too slow.
+/// Frames a socket may have waiting before it is cut as too slow. Its queue
+/// holds one more, kept for the close, so a socket cut for being slow is
+/// still told why (1013: reconnect) and never reads the end of its queue as
+/// the room closing.
 pub const OUT_QUEUE: usize = 8;
 /// The beat between a question closing and its reveal (the correct options
 /// and the ranking), in milliseconds. The host's `next` skips it.
@@ -129,6 +132,17 @@ pub(super) struct Sock {
     pub(super) out: mpsc::Sender<Out>,
     /// Index into the game's players, for a player socket in a game.
     pub(super) pid: Option<usize>,
+}
+
+impl Sock {
+    /// Queue `out` for the socket; false when the socket is too slow (only
+    /// the slot kept for the close is free). A close always finds that slot.
+    pub(super) fn deliver(&self, out: Out) -> bool {
+        if !matches!(out, Out::Close(..)) && self.out.capacity() <= 1 {
+            return false;
+        }
+        self.out.try_send(out).is_ok()
+    }
 }
 
 impl Drop for Sock {
@@ -476,7 +490,7 @@ impl Room {
             .collect();
         for id in due {
             if let Some(s) = self.socks.get(&id) {
-                let _ = s.out.try_send(Out::Close(1001, "room closed"));
+                let _ = s.deliver(Out::Close(1001, "room closed"));
             }
             self.detach(id).await;
         }
@@ -501,7 +515,7 @@ impl Room {
                     self.finish(EndReason::Restart).await;
                 }
                 for s in self.socks.values() {
-                    let _ = s.out.try_send(Out::Close(1001, "restart"));
+                    let _ = s.deliver(Out::Close(1001, "restart"));
                 }
                 self.socks.clear();
                 let _ = reply.send(());
@@ -515,7 +529,7 @@ impl Room {
 
     pub(super) fn push(&mut self, sock: u64, out: Out) {
         if let Some(s) = self.socks.get(&sock)
-            && s.out.try_send(out).is_err()
+            && !s.deliver(out)
         {
             self.slow.push(sock);
         }
@@ -526,7 +540,7 @@ impl Room {
         let mut slow = Vec::new();
         for (id, s) in &self.socks {
             if let Some(out) = each(s, self)
-                && s.out.try_send(out).is_err()
+                && !s.deliver(out)
             {
                 slow.push(*id);
             }
@@ -546,7 +560,7 @@ impl Room {
     async fn reap(&mut self) {
         while let Some(id) = self.slow.pop() {
             if let Some(s) = self.socks.get(&id) {
-                let _ = s.out.try_send(Out::Close(1013, "slow"));
+                let _ = s.deliver(Out::Close(1013, "slow"));
             }
             self.detach(id).await;
         }
@@ -649,7 +663,7 @@ impl Room {
             .collect();
         for id in gone {
             if let Some(s) = self.socks.get(&id) {
-                let _ = s.out.try_send(Out::Close(1008, "forgotten"));
+                let _ = s.deliver(Out::Close(1008, "forgotten"));
             }
             self.detach(id).await;
         }

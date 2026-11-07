@@ -269,8 +269,11 @@ async fn serve(state: AppState, mut socket: WebSocket, unknown: UnknownGuard) {
                         break;
                     }
                 }
+                // The room let the socket go without a close (every way it
+                // drops one queues a close first): not the lesson ending, so
+                // the client reconnects.
                 None => {
-                    close(&mut socket, 1001, "room closed").await;
+                    close(&mut socket, 1013, "try again").await;
                     break;
                 }
             },

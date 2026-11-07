@@ -1072,7 +1072,7 @@ impl Room {
             .collect();
         for id in gone {
             if let Some(s) = self.socks.get(&id) {
-                let _ = s.out.try_send(Out::Close(1008, "forgotten"));
+                let _ = s.deliver(Out::Close(1008, "forgotten"));
             }
             self.detach(id).await;
         }
