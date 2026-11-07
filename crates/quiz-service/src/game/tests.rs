@@ -2,7 +2,7 @@
 
 use super::frames::{ClientFrame, Out};
 use super::registry::{Deps, Rooms};
-use super::room::REVEAL_DELAY_MS;
+use super::room::{self, REVEAL_DELAY_MS};
 use super::room::{Member, RoomHandle};
 use super::store::{GameStore, LoadedQuiz};
 use crate::auth::Role;
@@ -733,7 +733,12 @@ async fn at_most_500_players_and_a_slow_socket_is_cut() {
         }
         h.frames();
     }
-    while ps[0].rx.try_recv().is_ok() {}
+    let trace = ps[0].trace();
+    assert_eq!(
+        trace.last().map(String::as_str),
+        Some("close:1013:slow"),
+        "the unread socket is told why it was cut"
+    );
     assert!(
         matches!(
             ps[0].rx.try_recv(),
@@ -741,6 +746,27 @@ async fn at_most_500_players_and_a_slow_socket_is_cut() {
         ),
         "the unread socket was cut"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_player_stalled_in_the_lobby_is_told_to_reconnect_not_that_the_room_closed() {
+    let w = world();
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    let mut stalled = player(&w, 0).await;
+    // classmates keep arriving; the stalled socket reads none of the counts
+    let mut others = Vec::new();
+    for n in 1..=room::OUT_QUEUE + 4 {
+        others.push(player(&w, n).await);
+        settle().await;
+        adv(room::PROGRESS_EVERY).await;
+    }
+    let trace = stalled.trace();
+    assert_eq!(trace.len(), room::OUT_QUEUE + 1, "{trace:?}");
+    assert_eq!(trace.last().map(String::as_str), Some("close:1013:slow"));
+    assert!(!trace.contains(&CLOSED.to_string()));
+    h.frames();
 }
 
 #[tokio::test(start_paused = true)]

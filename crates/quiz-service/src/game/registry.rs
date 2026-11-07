@@ -271,10 +271,11 @@ impl Rooms {
     }
 }
 
-/// The queue between a room and one socket's task.
+/// The queue between a room and one socket's task: [`room::OUT_QUEUE`]
+/// frames and the close.
 pub fn out_channel() -> (
     tokio::sync::mpsc::Sender<Out>,
     tokio::sync::mpsc::Receiver<Out>,
 ) {
-    tokio::sync::mpsc::channel(room::OUT_QUEUE)
+    tokio::sync::mpsc::channel(room::OUT_QUEUE + 1)
 }
