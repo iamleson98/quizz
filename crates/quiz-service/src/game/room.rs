@@ -1162,7 +1162,13 @@ impl Room {
             .game
             .as_mut()
             .ok_or_else(|| AppError::NotFound("game".into()))?;
-        if g.phase != Phase::Question || now >= g.q_deadline || q as usize != g.qi + 1 {
+        // A frame received before this question opened was meant for another one (a guess
+        // sent ahead while the room was busy): it is not an instant answer to this one.
+        if g.phase != Phase::Question
+            || now < g.q_started
+            || now >= g.q_deadline
+            || q as usize != g.qi + 1
+        {
             return Err(AppError::Conflict("that question is not open".into()));
         }
         let question = &g.questions[g.qi];

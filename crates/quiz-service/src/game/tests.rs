@@ -701,6 +701,42 @@ async fn the_results_of_an_ended_game_are_written_once_the_database_is_back() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_answer_received_before_its_question_opened_is_refused() {
+    let w = world();
+    let p = player(&w, 1).await;
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&p, 1, 0b0010).await;
+    settle().await;
+    beat().await;
+    // a guess at the next question, received while the first one is revealed
+    let guessed = Instant::now();
+    adv(Duration::from_secs(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    p.room
+        .frame(p.sock, ClientFrame::Answer { q: 2, mask: 0b0010 }, guessed)
+        .await;
+    settle().await;
+    adv(Duration::from_secs(25)).await;
+    beat().await;
+    h.send(ClientFrame::End).await;
+    settle().await;
+    let answers: usize = w
+        .store
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| b.answers.len())
+        .sum();
+    assert_eq!(answers, 1, "only the answer to the first question counts");
+    h.frames();
+}
+
+#[tokio::test(start_paused = true)]
 async fn forgetting_a_player_blanks_their_name_and_forgetting_the_host_ends_the_game() {
     let w = world();
     let mut p = player(&w, 1).await;
