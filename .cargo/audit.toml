@@ -1,0 +1,10 @@
+# cargo audit: advisories that do not reach this service, each with the reason.
+#
+# jsonwebtoken's only pure-Rust backend (`rust_crypto`) brings in every algorithm's crates.
+# The service signs and checks HS256 tickets only (`EncodingKey`/`DecodingKey::from_secret`,
+# `Validation::new(Algorithm::HS256)`), so no RSA or elliptic-curve code ever runs.
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071", # rsa: Marvin timing attack on RSA decryption; no RSA key exists here
+    "RUSTSEC-2026-0387", # crypto-bigint: timing in constant-time ops; reached only through RSA/EC
+]

@@ -1212,12 +1212,32 @@ impl Room {
 
     /// Store the results, in one transaction, with the end of the game. Done
     /// once, when the podium opens however it opened; the end of the game
-    /// finds them stored.
-    pub(super) async fn quest_store(&mut self) {
+    /// finds them stored. Returns false when they are still to be written.
+    pub(super) async fn quest_store(&mut self) -> bool {
+        let Some(batch) = self.quest_batch() else {
+            return true;
+        };
+        let id = batch.game_id;
+        match self.deps.store.write(batch).await {
+            Ok(()) => {
+                if let Some(q) = self.quest.as_mut() {
+                    q.stored = true;
+                }
+                true
+            }
+            Err(e) => {
+                tracing::error!(error = %e, game = id, "writing the quest results failed");
+                false
+            }
+        }
+    }
+
+    /// The results of the game with its end, unless they are stored (or there is no game).
+    fn quest_batch(&self) -> Option<Batch> {
         let ended_at = self.now_wall();
-        let Some(q) = self.quest.as_mut() else { return };
+        let q = self.quest.as_ref()?;
         if q.stored {
-            return;
+            return None;
         }
         let players: Vec<PlayerWrite> = q
             .players
@@ -1241,15 +1261,7 @@ impl Room {
             answers: Vec::new(),
             ended_at: Some(ended_at),
         };
-        let id = q.id;
-        match self.deps.store.write(batch).await {
-            Ok(()) => {
-                if let Some(q) = self.quest.as_mut() {
-                    q.stored = true;
-                }
-            }
-            Err(e) => tracing::error!(error = %e, game = id, "writing the quest results failed"),
-        }
+        Some(batch)
     }
 
     /// The host has been away too long: a game being played goes to the
@@ -1268,7 +1280,11 @@ impl Room {
     /// End the game: store the results (unless the podium already did), tell
     /// everyone.
     pub(super) async fn quest_finish(&mut self, reason: EndReason) {
-        self.quest_store().await;
+        if !self.quest_store().await
+            && let Some(batch) = self.quest_batch()
+        {
+            crate::game::store::write_later(self.deps.store.clone(), batch);
+        }
         if self.quest.take().is_none() {
             return;
         }

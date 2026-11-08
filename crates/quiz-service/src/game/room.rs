@@ -1162,7 +1162,13 @@ impl Room {
             .game
             .as_mut()
             .ok_or_else(|| AppError::NotFound("game".into()))?;
-        if g.phase != Phase::Question || now >= g.q_deadline || q as usize != g.qi + 1 {
+        // A frame received before this question opened was meant for another one (a guess
+        // sent ahead while the room was busy): it is not an instant answer to this one.
+        if g.phase != Phase::Question
+            || now < g.q_started
+            || now >= g.q_deadline
+            || q as usize != g.qi + 1
+        {
             return Err(AppError::Conflict("that question is not open".into()));
         }
         let question = &g.questions[g.qi];
@@ -1366,8 +1372,11 @@ impl Room {
         }
         let ended_at = self.now_wall();
         // the results were stored when the podium opened
-        if !self.game.as_ref().is_some_and(|g| g.stored) {
-            self.persist(Some(ended_at)).await;
+        if !self.game.as_ref().is_some_and(|g| g.stored)
+            && !self.persist(Some(ended_at)).await
+            && let Some((batch, _)) = self.take_batch(Some(ended_at))
+        {
+            super::store::write_later(self.deps.store.clone(), batch);
         }
         self.game = None;
         for s in self.socks.values_mut() {
@@ -1382,7 +1391,33 @@ impl Room {
     /// Write the dirty players and the answers waiting (and the end of the
     /// game). A failed write keeps them for the next one.
     async fn persist(&mut self, ended_at: Option<i64>) -> bool {
-        let Some(g) = &mut self.game else { return true };
+        let Some((batch, written)) = self.take_batch(ended_at) else {
+            return true;
+        };
+        match self.deps.store.write(batch.clone()).await {
+            Ok(()) => {
+                if let Some(g) = &mut self.game {
+                    for p in g.players.iter_mut().filter(|p| written.contains(&p.id)) {
+                        p.dirty = false;
+                    }
+                }
+                true
+            }
+            Err(e) => {
+                tracing::error!(error = %e, game = batch.game_id, "writing the game failed");
+                if let Some(g) = &mut self.game {
+                    g.pending = batch.answers;
+                }
+                false
+            }
+        }
+    }
+
+    /// What a write would store now (the dirty players, the answers waiting, the end of the
+    /// game), with the ids of the players it carries; `None` when there is nothing to write.
+    /// The answers are taken: a failed write puts them back.
+    fn take_batch(&mut self, ended_at: Option<i64>) -> Option<(Batch, Vec<i64>)> {
+        let g = self.game.as_mut()?;
         let players: Vec<PlayerWrite> = g
             .players
             .iter()
@@ -1407,25 +1442,9 @@ impl Room {
             ended_at,
         };
         if batch.players.is_empty() && batch.answers.is_empty() && ended_at.is_none() {
-            return true;
+            return None;
         }
-        match self.deps.store.write(batch.clone()).await {
-            Ok(()) => {
-                if let Some(g) = &mut self.game {
-                    for p in g.players.iter_mut().filter(|p| written.contains(&p.id)) {
-                        p.dirty = false;
-                    }
-                }
-                true
-            }
-            Err(e) => {
-                tracing::error!(error = %e, game = batch.game_id, "writing the game failed");
-                if let Some(g) = &mut self.game {
-                    g.pending = batch.answers;
-                }
-                false
-            }
-        }
+        Some((batch, written))
     }
 }
 
