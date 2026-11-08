@@ -1553,3 +1553,20 @@ async fn at_the_room_close_a_quest_ends_and_is_stored_before_its_sockets_close()
     assert_eq!(p.trace(), vec![CLOSED]);
     nothing_left(&q.w);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_quest_whose_last_write_failed_is_written_once_the_database_is_back() {
+    let q = Quest::new();
+    let (mut h, mut ps, _) = running(&q, 2, 0).await;
+    *q.w.store.fail_writes.lock().unwrap() = true;
+    h.send(ClientFrame::End).await; // the podium's write fails
+    settle().await;
+    h.send(ClientFrame::End).await; // so does the end's: the room lets the game go
+    settle().await;
+    assert_eq!(ended_writes(&q), 0);
+    *q.w.store.fail_writes.lock().unwrap() = false;
+    adv(Duration::from_secs(2)).await;
+    assert_eq!(ended_writes(&q), 1, "written later, once");
+    h.frames();
+    ps[0].frames();
+}

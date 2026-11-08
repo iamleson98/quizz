@@ -671,6 +671,36 @@ async fn a_failed_write_is_retried_with_the_next_one() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_results_of_an_ended_game_are_written_once_the_database_is_back() {
+    let w = world();
+    let p = player(&w, 1).await;
+    let mut h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&p, 1, 0b0010).await;
+    settle().await;
+    *w.store.fail_writes.lock().unwrap() = true;
+    h.send(ClientFrame::End).await; // the podium's write fails
+    settle().await;
+    h.send(ClientFrame::End).await; // so does the end's: the room lets the game go
+    settle().await;
+    let ended = |w: &World| {
+        w.store
+            .batches
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.ended_at.is_some() && b.answers.len() == 1)
+    };
+    assert!(!ended(&w));
+    *w.store.fail_writes.lock().unwrap() = false;
+    adv(Duration::from_secs(2)).await;
+    assert!(ended(&w), "the results and the end were written later");
+    h.frames();
+}
+
+#[tokio::test(start_paused = true)]
 async fn forgetting_a_player_blanks_their_name_and_forgetting_the_host_ends_the_game() {
     let w = world();
     let mut p = player(&w, 1).await;
