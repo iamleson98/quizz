@@ -67,8 +67,14 @@ pub struct Member {
     pub out: mpsc::Sender<Out>,
 }
 
+/// Read-only watchers a room carries at most (a recording server and the one
+/// taking over from it).
+pub const MAX_OBSERVERS: usize = 4;
+
 pub enum Cmd {
     Attach(Member, oneshot::Sender<AppResult<()>>),
+    /// A read-only watcher: the socket id and its queue.
+    Observe(u64, mpsc::Sender<Out>, oneshot::Sender<AppResult<()>>),
     Detach(u64),
     /// A client frame and the instant it was received by the socket (not when
     /// the room got to it): answers are timed from it.
@@ -93,6 +99,19 @@ impl RoomHandle {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Attach(member, tx))
+            .await
+            .map_err(|_| RoomGone)?;
+        rx.await.map_err(|_| RoomGone)
+    }
+
+    pub async fn observe(
+        &self,
+        sock: u64,
+        out: mpsc::Sender<Out>,
+    ) -> Result<AppResult<()>, RoomGone> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Observe(sock, out, tx))
             .await
             .map_err(|_| RoomGone)?;
         rx.await.map_err(|_| RoomGone)
@@ -292,6 +311,10 @@ pub struct Room {
     pub(super) id: u64,
     pub(super) deps: Deps,
     pub(super) socks: HashMap<u64, Sock>,
+    /// Read-only watchers (see [`Room::observe`]). They are not in `socks`, so
+    /// they are not a host, not somebody connected and not a player: only the
+    /// broadcasts reach them.
+    observers: HashMap<u64, Sock>,
     game: Option<Game>,
     /// The quest game, when this room plays one instead of a race.
     pub(super) quest: Option<super::quest::Quest>,
@@ -322,6 +345,7 @@ pub fn spawn(deps: Deps, sid: String, id: u64) -> RoomHandle {
         wall0: (deps.now_ms)(),
         deps,
         socks: HashMap::new(),
+        observers: HashMap::new(),
         game: None,
         quest: None,
         t0: now,
@@ -504,6 +528,10 @@ impl Room {
                 let res = self.attach(member);
                 let _ = reply.send(res);
             }
+            Cmd::Observe(sock, out, reply) => {
+                let res = self.observe(sock, out);
+                let _ = reply.send(res);
+            }
             Cmd::Detach(sock) => self.detach(sock).await,
             Cmd::Frame(sock, frame, at) => self.frame(sock, frame, at).await,
             Cmd::Forget(user, reply) => {
@@ -514,10 +542,11 @@ impl Room {
                 if self.game.is_some() || self.quest.is_some() {
                     self.finish(EndReason::Restart).await;
                 }
-                for s in self.socks.values() {
+                for s in self.socks.values().chain(self.observers.values()) {
                     let _ = s.deliver(Out::Close(1001, "restart"));
                 }
                 self.socks.clear();
+                self.observers.clear();
                 let _ = reply.send(());
                 return true;
             }
@@ -545,6 +574,15 @@ impl Room {
                 slow.push(*id);
             }
         }
+        // a watcher gets what a host gets, less the names (see
+        // `frames::for_observer`)
+        for (id, s) in &self.observers {
+            if let Some(out) = each(s, self).and_then(frames::for_observer)
+                && !s.deliver(out)
+            {
+                slow.push(*id);
+            }
+        }
         self.slow.extend(slow);
     }
 
@@ -559,7 +597,7 @@ impl Room {
     /// Detach sockets that cannot keep up or went away.
     async fn reap(&mut self) {
         while let Some(id) = self.slow.pop() {
-            if let Some(s) = self.socks.get(&id) {
+            if let Some(s) = self.socks.get(&id).or_else(|| self.observers.get(&id)) {
                 let _ = s.deliver(Out::Close(1013, "slow"));
             }
             self.detach(id).await;
@@ -614,7 +652,56 @@ impl Room {
         Ok(())
     }
 
+    /// Attach a read-only watcher. It is sent what a host is sent after
+    /// `hello` (the current state first, so a reconnect heals), then every
+    /// shared frame the host gets, less the names. It takes no seat, and it
+    /// does not count as the host or as anybody being connected, so the room's
+    /// own timers (the host left, nobody here) run as if it were not there.
+    fn observe(&mut self, sock: u64, out: mpsc::Sender<Out>) -> AppResult<()> {
+        if self.observers.len() >= MAX_OBSERVERS {
+            return Err(AppError::Conflict("too many observers".into()));
+        }
+        let now = Instant::now();
+        let wall = self.wall(now);
+        let outs = if let Some(q) = &mut self.quest {
+            q.sync_host(now, wall)
+        } else {
+            let mut outs = vec![self.sync_for(None)];
+            if let Some(g) = &self.game
+                && g.phase == Phase::Question
+            {
+                outs.push(Out::Plain(frames::progress(
+                    g.answered,
+                    g.active_count,
+                    &g.choices,
+                    &g.provisional_top(),
+                )));
+            }
+            outs
+        };
+        let watcher = Sock {
+            user: String::new(),
+            name: String::new(),
+            // the host's form of every frame
+            role: Role::Host,
+            cid: String::new(),
+            rc: 0,
+            close_at: now,
+            out,
+            pid: None,
+        };
+        for out in outs.into_iter().filter_map(frames::for_observer) {
+            let _ = watcher.deliver(out);
+        }
+        self.observers.insert(sock, watcher);
+        self.schedule_flush();
+        Ok(())
+    }
+
     pub(super) async fn detach(&mut self, sock: u64) {
+        if self.observers.remove(&sock).is_some() {
+            return;
+        }
         if self.quest.is_some() {
             return self.quest_detach(sock).await;
         }
@@ -922,12 +1009,16 @@ fn kind_code(k: QuestionKind) -> u8 {
 impl Room {
     /// The frame that brings a socket up to date with the room.
     fn sync_frame(&self, sock: u64) -> Out {
+        self.sync_for(self.socks[&sock].pid)
+    }
+
+    /// The state frame for a player (`Some`) or a host or watcher (`None`).
+    fn sync_for(&self, pid: Option<usize>) -> Out {
         let now = self.now_wall();
         let Some(g) = &self.game else {
             return Out::Plain(frames::none(now));
         };
-        let s = &self.socks[&sock];
-        let player = s.pid.map(|p| &g.players[p]);
+        let player = pid.map(|p| &g.players[p]);
         match g.phase {
             Phase::Lobby => Out::Plain(frames::lobby(
                 now,

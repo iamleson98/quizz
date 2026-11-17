@@ -189,6 +189,39 @@ impl Rooms {
         Err(AppError::Internal("room kept closing".into()))
     }
 
+    /// Whether the session has a room now.
+    pub fn has_room(&self, sid: &str) -> bool {
+        self.0
+            .reg
+            .lock()
+            .expect("rooms lock")
+            .rooms
+            .contains_key(sid)
+    }
+
+    /// Attach a read-only watcher to the room of `sid`. It never creates the
+    /// room: with none there is nothing to watch.
+    pub async fn observe(
+        &self,
+        sid: &str,
+        sock: u64,
+        out: tokio::sync::mpsc::Sender<Out>,
+    ) -> AppResult<RoomHandle> {
+        let handle = {
+            let reg = self.0.reg.lock().expect("rooms lock");
+            reg.rooms.get(sid).cloned()
+        };
+        let no_room = || AppError::NotFound("room".into());
+        let handle = handle.ok_or_else(no_room)?;
+        match handle.observe(sock, out).await {
+            Ok(res) => res.map(|()| handle),
+            Err(RoomGone) => {
+                self.room_closed(sid, handle.id);
+                Err(no_room())
+            }
+        }
+    }
+
     /// A room's task ended.
     pub fn room_closed(&self, sid: &str, id: u64) {
         let mut reg = self.0.reg.lock().expect("rooms lock");

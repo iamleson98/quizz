@@ -93,6 +93,7 @@ pub fn internal_router(state: AppState, metrics: PrometheusHandle) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
         .route("/internal/users/{id}/forget", post(forget))
+        .route("/internal/sessions/{sid}/watch", get(ws::watch))
         .layer(Extension(metrics))
         .with_state(state)
 }
@@ -125,6 +126,19 @@ async fn metrics_handler(Extension(handle): Extension<PrometheusHandle>) -> Resp
         .into_response()
 }
 
+/// Refuse a call that does not carry the internal key.
+pub fn check_internal_key(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    let given = headers
+        .get(HeaderName::from_static(INTERNAL_KEY_HEADER))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if keys_match(&state.cfg.internal_key, given) {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized("bad internal key".into()))
+    }
+}
+
 /// Delete a person's quizzes and games, and blank their name on other
 /// teachers' scoreboards. Called when an account is deleted.
 async fn forget(
@@ -132,13 +146,7 @@ async fn forget(
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let given = headers
-        .get(HeaderName::from_static(INTERNAL_KEY_HEADER))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !keys_match(&state.cfg.internal_key, given) {
-        return Err(AppError::Unauthorized("bad internal key".into()));
-    }
+    check_internal_key(&state, &headers)?;
     if user_id.is_empty() || user_id.len() > 64 {
         return Err(AppError::BadRequest("not a user id".into()));
     }

@@ -246,6 +246,35 @@ server, so a wrong client clock cannot buy points.
   reconnecting is pointless (the `hello` is refused, see above). A socket whose
   ticket has a later `rc` stays until its own.
 
+## The observer socket (recording)
+
+The LMS server records a lesson's quiz by watching the room: `GET
+/internal/sessions/{sid}/watch` on the **internal** listener (the one with
+`/healthz`), upgraded to a websocket. It carries the same `x-internal-key`
+header as the other internal calls; it needs no ticket and no `Origin`, and
+offers no subprotocol. Answers: 401 for a bad or missing key, 404 while the
+session has no room (retry: the room exists from the first socket of the
+lesson), 409 when the room already has 4 watchers.
+
+- It is **read-only**: any frame it sends closes the socket (1008, "read only").
+- The first frame is the room's current state, exactly as a host's after
+  `hello` (a question comes with the live selections that follow), so a
+  reconnect or a handover heals by itself. After that it is sent what a host is
+  sent: types 0, 1, 2, 3, 4, 11, 5 and 6 (host forms, no personal tail), 7, and
+  for a quest 20, 22 and 29.
+- It is **not** a host, a player or somebody connected: it takes no seat, does
+  not count toward the 500 players, does not keep a room or a game alive, and
+  does not stop "the host left" (reason `4`) or the 5-minute "nobody connected"
+  end (reason `2`) from firing. It never creates a room.
+- **Names**: the lists of names (types 10 and 21) are not sent; the names in the
+  provisional ranking of type 4 and in the quest board of type 29 are sent as
+  `""`; the podium (type 6) is `[6,top3,top3]`, the host's form with the top
+  three in place of the full order. The reveal (type 5) is the host's: its top
+  five and no personal tail. Those top rows keep their names (the class sees
+  them; the watcher's owner decides who may keep one).
+- When the room ends the socket is closed with 1001 "room closed"; a watcher
+  that cannot keep up is closed with 1013.
+
 ## What it costs
 
 Per player per question (80 characters, four options of 30): the question frame
