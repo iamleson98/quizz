@@ -12,6 +12,7 @@
 
 pub mod chest;
 pub mod frames;
+pub mod resume;
 #[cfg(test)]
 mod tests;
 
@@ -626,8 +627,10 @@ impl Quest {
         Ok(())
     }
 
-    /// Everything that is due: missed questions, pauses over.
-    pub(super) fn tick(&mut self, now: Instant, fx: &mut Fx) {
+    /// Everything that is due: missed questions, pauses over. True when a
+    /// player's state moved.
+    pub(super) fn tick(&mut self, now: Instant, fx: &mut Fx) -> bool {
+        let mut moved = false;
         while let Some(&Reverse((when, pid, serial))) = self.timers.peek() {
             if when > now {
                 break;
@@ -636,6 +639,7 @@ impl Quest {
             if self.running().is_none() || self.players[pid].serial != serial {
                 continue;
             }
+            moved = true;
             match self.players[pid].state {
                 PState::Asking { .. } => self.expire(pid, now, fx),
                 PState::Pause(until) if now >= until => {
@@ -645,6 +649,7 @@ impl Quest {
                 _ => {}
             }
         }
+        moved
     }
 
     /// The earliest moment this game needs attention.
@@ -1041,6 +1046,7 @@ impl Room {
             self.push(m.sock, out);
         }
         self.schedule_flush();
+        self.mark_state_dirty();
         Ok(())
     }
 
@@ -1082,6 +1088,7 @@ impl Room {
             let p = &mut q.players[pid];
             p.user = None;
             p.name.clear();
+            self.mark_state_dirty();
         }
     }
 
@@ -1155,6 +1162,7 @@ impl Room {
         }
         self.apply_fx(fx);
         self.schedule_flush();
+        self.mark_state_dirty();
         Ok(())
     }
 
@@ -1166,7 +1174,7 @@ impl Room {
         let now = Instant::now();
         let Some(q) = self.quest.as_mut() else { return };
         let mut fx = Fx::default();
-        q.tick(now, &mut fx);
+        let moved = q.tick(now, &mut fx);
         if let QPhase::Running { ends_at } = q.phase {
             if now >= ends_at {
                 q.time_up(&mut fx);
@@ -1178,6 +1186,9 @@ impl Room {
         let (rc_at, idle_at) = (q.rc_at, q.idle_at);
         self.apply_fx(fx);
         self.schedule_flush();
+        if moved {
+            self.mark_state_dirty();
+        }
         if podium {
             self.quest_store().await;
         }

@@ -21,6 +21,8 @@
 //! likely from a streak of 6; everything else shares what is left in its
 //! usual proportions, so the odds always sum to 100%.
 
+use serde::{Deserialize, Serialize};
+
 /// Coins a jackpot is worth.
 pub const JACKPOT: i64 = 200;
 /// Answers a booster doubles.
@@ -32,7 +34,7 @@ pub const STEAL_PERCENT: i64 = 10;
 /// ...but at most this many.
 pub const STEAL_CAP: i64 = 100;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     Coins(i64),
     Jackpot,

@@ -36,7 +36,7 @@ pub struct QuizRow {
     pub updated_at: i64,
 }
 
-#[derive(Clone, Debug, FromRow)]
+#[derive(Clone, Debug, FromRow, Serialize, Deserialize)]
 pub struct QuestionRow {
     pub id: i64,
     pub quiz_id: i64,
@@ -47,7 +47,7 @@ pub struct QuestionRow {
     pub explanation: Option<String>,
 }
 
-#[derive(Clone, Debug, FromRow)]
+#[derive(Clone, Debug, FromRow, Serialize, Deserialize)]
 pub struct OptionRow {
     pub id: i64,
     pub question_id: i64,
@@ -57,7 +57,7 @@ pub struct OptionRow {
 }
 
 /// A question together with its options, as needed for grading.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QuestionWithOptions {
     pub question: QuestionRow,
     pub options: Vec<OptionRow>,

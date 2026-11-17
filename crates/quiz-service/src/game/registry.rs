@@ -2,6 +2,7 @@
 //! are running, who is connected.
 
 use super::frames::Out;
+use super::resume::Saved;
 use super::room::{self, Member, RoomGone, RoomHandle};
 use super::store::GameStore;
 use crate::error::{AppError, AppResult};
@@ -58,6 +59,8 @@ struct Registry {
 #[derive(Default)]
 struct Inner {
     reg: Mutex<Registry>,
+    /// Set when the service is stopping: no socket attaches any more.
+    closing: std::sync::atomic::AtomicBool,
     next_room: AtomicU64,
     next_sock: AtomicU64,
     unknown: std::sync::atomic::AtomicUsize,
@@ -175,6 +178,10 @@ impl Rooms {
         for _ in 0..3 {
             let handle = {
                 let mut reg = self.0.reg.lock().expect("rooms lock");
+                // under the lock that creates rooms, so that none starts once the stop began
+                if self.closing() {
+                    return Err(AppError::Conflict("the service is stopping".into()));
+                }
                 reg.rooms
                     .entry(sid.to_string())
                     .or_insert_with(|| {
@@ -189,6 +196,11 @@ impl Rooms {
             }
         }
         Err(AppError::Internal("room kept closing".into()))
+    }
+
+    /// Whether the service is stopping (see [`Rooms::shutdown`]).
+    pub fn closing(&self) -> bool {
+        self.0.closing.load(Ordering::Relaxed)
     }
 
     /// Whether the session has a room now.
@@ -250,6 +262,28 @@ impl Rooms {
         Ok(())
     }
 
+    /// Put a game that was running when the service stopped back in a room of
+    /// its own, with nobody attached yet (see [`super::resume`]).
+    pub fn restore(&self, deps: &Deps, sid: &str, saved: Saved) -> AppResult<()> {
+        self.try_begin(sid, saved.host(), saved.quiz_id)?;
+        let id = self.0.next_room.fetch_add(1, Ordering::Relaxed);
+        let paused = saved.downtime((deps.now_ms)());
+        let handle = room::spawn_restored(deps.clone(), sid.to_string(), id, saved.game, paused);
+        self.0
+            .reg
+            .lock()
+            .expect("rooms lock")
+            .rooms
+            .insert(sid.to_string(), handle);
+        Ok(())
+    }
+
+    /// The quiz of the game running in `sid`.
+    pub fn quiz_of(&self, sid: &str) -> Option<i64> {
+        let reg = self.0.reg.lock().expect("rooms lock");
+        reg.running.get(sid).map(|(_, quiz_id)| *quiz_id)
+    }
+
     /// The game of `sid` is over.
     pub fn game_ended(&self, sid: &str) {
         let mut reg = self.0.reg.lock().expect("rooms lock");
@@ -305,9 +339,15 @@ impl Rooms {
         writes.push(write);
     }
 
-    /// End every game and close every socket, then wait for the final writes that are still
-    /// being tried; all within `limit`.
+    /// Write the state of every running game (they are not ended: the next process puts them
+    /// back) and close every socket, then wait for the final writes of ended games that are
+    /// still being tried; all within `limit`.
     pub async fn shutdown(&self, limit: Duration) {
+        // from now on a socket cannot reach a room that is being stopped, nor start one
+        {
+            let _reg = self.0.reg.lock().expect("rooms lock");
+            self.0.closing.store(true, Ordering::Relaxed);
+        }
         let all = async {
             futures::future::join_all(self.handles().into_iter().map(|h| async move {
                 h.shutdown().await;

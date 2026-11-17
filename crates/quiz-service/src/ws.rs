@@ -210,6 +210,11 @@ async fn serve(state: AppState, mut socket: WebSocket, unknown: UnknownGuard) {
     };
     let room = match state.rooms.attach(state.deps(), &sid, member).await {
         Ok(room) => room,
+        Err(_) if state.rooms.closing() => {
+            // the service is stopping: reconnecting reaches the next process
+            close(&mut socket, 1001, "restart").await;
+            return;
+        }
         Err(e) => {
             let _ = send(
                 &mut socket,

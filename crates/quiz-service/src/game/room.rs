@@ -11,6 +11,7 @@
 
 use super::frames::{self, ClientFrame, EndReason, Out, Tail};
 use super::registry::Deps;
+use super::resume::Writer;
 use super::scoring::{points_for, streak_bonus};
 use crate::auth::Role;
 use crate::error::{AppError, AppResult};
@@ -20,11 +21,14 @@ use crate::model::{QuestionKind, QuestionWithOptions};
 use crate::repo::games::{AnswerWrite, Batch, NewGame, PlayerWrite};
 use crate::repo::quizzes::limits::MAX_PLAYERS_PER_GAME;
 use axum::extract::ws::Utf8Bytes;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
+
+pub mod resume;
 
 /// The host's `progress` count is refreshed at most this often.
 pub const PROGRESS_EVERY: Duration = Duration::from_millis(500);
@@ -55,6 +59,9 @@ pub const DISCONNECT_GRACE: Duration = Duration::from_secs(10);
 pub const REVEAL_DELAY_MS: u64 = 2500;
 /// Rows of the host's provisional ranking.
 pub const PROVISIONAL_TOP: usize = 10;
+/// The furthest from now a stored time is taken to be (it keeps a damaged snapshot from
+/// overflowing the clock).
+const MAX_SPAN: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 /// How many commands may wait for the room.
 const CMD_QUEUE: usize = 1024;
 
@@ -176,7 +183,7 @@ impl Drop for Sock {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum Phase {
     Lobby,
     Question,
@@ -186,6 +193,7 @@ enum Phase {
     Podium,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Answer {
     question_id: i64,
     selected: Vec<i64>,
@@ -200,6 +208,7 @@ struct Answer {
     time_ms: i64,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Player {
     id: i64,
     /// `None` once the person is forgotten.
@@ -218,11 +227,14 @@ struct Player {
     /// Questions answered.
     answered: u32,
     /// Sockets of this player attached now.
+    #[serde(skip)]
     live: u32,
     /// When the last socket of this player went, until they attach again.
+    #[serde(skip)]
     gone_at: Option<Instant>,
     /// In the roster (a lobby player who left is not).
     active: bool,
+    #[serde(skip)]
     dirty: bool,
     /// 1-based rank at the last reveal; 0 until ranked.
     rank: u32,
@@ -359,33 +371,72 @@ pub struct Room {
     pub(super) count_dirty: bool,
     pub(super) flush_at: Option<Instant>,
     pub(super) last_flush: Instant,
+    /// Writes the game's snapshots (see [`super::resume`]), once there is one.
+    writer: Option<Writer>,
+    /// Where the game was when its snapshot was last handed to the writer
+    /// (`None`: no game, no snapshot).
+    snap_key: Option<(u8, usize)>,
+    /// The game whose row the writer holds for this room (so that its delete cannot take
+    /// the row of the next game).
+    snap_game: Option<i64>,
+    /// When the state, changed within a phase, is next written.
+    snap_due: Option<Instant>,
+    snap_last: Instant,
 }
 
 /// Start the room task for session `sid`.
 pub fn spawn(deps: Deps, sid: String, id: u64) -> RoomHandle {
     let (tx, rx) = mpsc::channel(CMD_QUEUE);
-    let now = Instant::now();
-    let room = Room {
-        sid,
-        id,
-        wall0: (deps.now_ms)(),
-        deps,
-        socks: HashMap::new(),
-        observers: HashMap::new(),
-        game: None,
-        quest: None,
-        t0: now,
-        slow: Vec::new(),
-        sock_close_at: None,
-        host_gone_at: None,
-        empty_at: None,
-        progress_dirty: false,
-        count_dirty: false,
-        flush_at: None,
-        last_flush: now - PROGRESS_EVERY,
-    };
+    tokio::spawn(Room::new(deps, sid, id).run(rx));
+    RoomHandle { id, tx }
+}
+
+/// Start the room task for session `sid` with a game that was running when
+/// the service stopped, nobody attached yet. `paused` is `Some(ms)` after a planned
+/// stop: the game's question and game clocks are pushed on by that long.
+pub fn spawn_restored(
+    deps: Deps,
+    sid: String,
+    id: u64,
+    game: super::resume::SavedGame,
+    paused: Option<i64>,
+) -> RoomHandle {
+    let (tx, rx) = mpsc::channel(CMD_QUEUE);
+    let mut room = Room::new(deps, sid, id);
+    room.resume(game, paused);
+    room.watch_presence();
     tokio::spawn(room.run(rx));
     RoomHandle { id, tx }
+}
+
+impl Room {
+    fn new(deps: Deps, sid: String, id: u64) -> Room {
+        let now = Instant::now();
+        Room {
+            sid,
+            id,
+            wall0: (deps.now_ms)(),
+            deps,
+            socks: HashMap::new(),
+            observers: HashMap::new(),
+            game: None,
+            quest: None,
+            t0: now,
+            slow: Vec::new(),
+            sock_close_at: None,
+            host_gone_at: None,
+            empty_at: None,
+            progress_dirty: false,
+            count_dirty: false,
+            flush_at: None,
+            last_flush: now - PROGRESS_EVERY,
+            writer: None,
+            snap_key: None,
+            snap_game: None,
+            snap_due: None,
+            snap_last: now,
+        }
+    }
 }
 
 async fn sleep_until_opt(t: Option<Instant>) {
@@ -397,7 +448,22 @@ async fn sleep_until_opt(t: Option<Instant>) {
 
 impl Room {
     pub(super) fn wall(&self, at: Instant) -> i64 {
-        self.wall0 + at.saturating_duration_since(self.t0).as_millis() as i64
+        if at >= self.t0 {
+            self.wall0 + at.saturating_duration_since(self.t0).as_millis() as i64
+        } else {
+            self.wall0 - self.t0.saturating_duration_since(at).as_millis() as i64
+        }
+    }
+
+    /// The instant of wall-clock time `wall` (unix ms); the room's start for
+    /// a time before the oldest instant the clock can go back to.
+    pub(super) fn instant_at(&self, wall: i64) -> Instant {
+        let d = Duration::from_millis(wall.abs_diff(self.wall0)).min(MAX_SPAN);
+        if wall >= self.wall0 {
+            self.t0 + d
+        } else {
+            self.t0.checked_sub(d).unwrap_or(self.t0)
+        }
     }
 
     pub(super) fn now_wall(&self) -> i64 {
@@ -429,6 +495,7 @@ impl Room {
             }
             self.reap().await;
             self.watch_presence();
+            self.sync_resume();
             if self.socks.is_empty() && self.game.is_none() && self.quest.is_none() {
                 break;
             }
@@ -453,6 +520,7 @@ impl Room {
             self.flush_at,
             self.quest_next_wake(),
             self.sock_close_at,
+            self.snap_due,
             self.empty_at,
             // with nobody connected the empty-room limit decides
             self.host_gone_at.filter(|_| !self.socks.is_empty()),
@@ -576,9 +644,9 @@ impl Room {
                 let _ = reply.send(());
             }
             Cmd::Shutdown(reply) => {
-                if self.game.is_some() || self.quest.is_some() {
-                    self.finish(EndReason::Restart).await;
-                }
+                // a running game is not ended: its state is written, and the
+                // next process picks it up
+                self.save_final().await;
                 for s in self.socks.values().chain(self.observers.values()) {
                     let _ = s.deliver(Out::Close(1001, "restart"));
                 }
@@ -685,6 +753,7 @@ impl Room {
         }
         if m.role == Role::Player && self.game.is_some() {
             self.mark_count_dirty();
+            self.mark_state_dirty();
         }
         Ok(())
     }
@@ -799,6 +868,7 @@ impl Room {
             p.user = None;
             p.name.clear();
             p.dirty = true;
+            self.mark_state_dirty();
         }
     }
 
@@ -1353,6 +1423,7 @@ impl Room {
         metrics::counter!("quiz_answers_total").increment(1);
         self.push(sock, Out::Plain(frames::ack()));
         self.mark_progress_dirty();
+        self.mark_state_dirty();
         if self.all_answered() {
             self.close_question().await;
         }

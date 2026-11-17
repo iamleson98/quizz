@@ -1,8 +1,9 @@
 //! Nothing lasts for ever.
 //!
 //! Every quiz carries the moment it expires and every ended game carries the
-//! moment its results expire; a sweep deletes what has passed. The three
-//! periods live here and nowhere else.
+//! moment its results expire, and the stored state of a running game (what a
+//! restart puts back) lasts only as long as the game; a sweep deletes what has
+//! passed. The four periods live here and nowhere else.
 //!
 //! *Use* of a quiz is saving an edit, starting a game on it, or keeping /
 //! un-keeping it; looking at it is not a use. Each use moves its expiry to
@@ -21,6 +22,10 @@ pub const UNKEPT_QUIZ_TTL_MS: i64 = 7 * DAY_MS;
 pub const KEPT_QUIZ_TTL_MS: i64 = 90 * DAY_MS;
 /// A game's results (players and answers) go this long after it ended.
 pub const RESULTS_TTL_MS: i64 = 90 * DAY_MS;
+/// The stored state of a running game (what a restart puts back) goes this long after it
+/// was last written. A running game writes it at least at every phase and no game lasts a
+/// day, so a row older than this belongs to no game.
+pub const RUNNING_GAME_TTL_MS: i64 = DAY_MS;
 
 /// How often the sweep runs after the one at startup.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -40,11 +45,14 @@ pub fn quiz_expiry(kept: bool, now_ms: i64) -> i64 {
 pub struct Swept {
     pub quizzes: u64,
     pub games: u64,
+    /// Stored running games that were not written for [`RUNNING_GAME_TTL_MS`].
+    pub running_games: u64,
 }
 
 /// Delete what has expired as of `now_ms`: quizzes (with their games), then
-/// games whose results have outlived their period while the quiz stays.
-/// Quizzes with a running game are left alone.
+/// games whose results have outlived their period while the quiz stays, and
+/// the stored state of running games that were not written for a day (the
+/// game is closed in the results). Quizzes with a running game are left alone.
 pub async fn sweep(state: &AppState, now_ms: i64) -> AppResult<Swept> {
     let running = state.rooms.running_quiz_ids();
     tx::write_tx(state, move |conn| {
@@ -69,20 +77,42 @@ pub async fn sweep(state: &AppState, now_ms: i64) -> AppResult<Swept> {
                     .execute(&mut *conn)
                     .await?
                     .rows_affected();
-            Ok(Swept { quizzes, games })
+            let stale = now_ms - RUNNING_GAME_TTL_MS;
+            sqlx::query(
+                "UPDATE games SET ended_at = ?1, expires_at = ?1 + ?2
+                 WHERE ended_at IS NULL
+                   AND id IN (SELECT game_id FROM running_games WHERE updated_at <= ?3)",
+            )
+            .bind(now_ms)
+            .bind(RESULTS_TTL_MS)
+            .bind(stale)
+            .execute(&mut *conn)
+            .await?;
+            let running_games = sqlx::query("DELETE FROM running_games WHERE updated_at <= ?1")
+                .bind(stale)
+                .execute(&mut *conn)
+                .await?
+                .rows_affected();
+            Ok(Swept {
+                quizzes,
+                games,
+                running_games,
+            })
         })
     })
     .await
 }
 
-/// A game that was running when the service stopped never ended properly:
-/// close it so its results start their own countdown. At startup no room
-/// exists, so every unended game is an orphan.
+/// A game that was running when the service stopped and was not put back
+/// never ended properly: close it so its results start their own countdown.
+/// At startup, once the stored running games are back in their rooms, every
+/// unended game that has no stored state is an orphan.
 pub async fn close_orphaned_games(state: &AppState, now_ms: i64) -> AppResult<u64> {
     tx::write_tx(state, move |conn| {
         Box::pin(async move {
             let res = sqlx::query(
-                "UPDATE games SET ended_at = ?1, expires_at = ?1 + ?2 WHERE ended_at IS NULL",
+                "UPDATE games SET ended_at = ?1, expires_at = ?1 + ?2
+                 WHERE ended_at IS NULL AND id NOT IN (SELECT game_id FROM running_games)",
             )
             .bind(now_ms)
             .bind(RESULTS_TTL_MS)
@@ -106,7 +136,12 @@ pub fn spawn(state: AppState) {
         loop {
             tick.tick().await;
             match sweep(&state, state.now_ms()).await {
-                Ok(s) => tracing::info!(quizzes = s.quizzes, games = s.games, "expiry sweep done"),
+                Ok(s) => tracing::info!(
+                    quizzes = s.quizzes,
+                    games = s.games,
+                    running_games = s.running_games,
+                    "expiry sweep done"
+                ),
                 Err(e) => tracing::error!(error = %e, "expiry sweep failed"),
             }
         }

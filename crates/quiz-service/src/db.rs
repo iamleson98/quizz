@@ -54,7 +54,22 @@ pub async fn connect_pool(cfg: &Config) -> AppResult<(SqlitePool, String)> {
         .connect_with(opts)
         .await?;
 
-    sqlx::migrate!().run(&pool).await?;
+    // An older build must still start on a database a newer one has migrated (a rollback of
+    // the image): it does not know the newer migrations, and that is not an error.
+    let mut migrator = sqlx::migrate!();
+    migrator.set_ignore_missing(true);
+    migrator.run(&pool).await?;
+    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
+        .fetch_all(&pool)
+        .await?;
+    for version in applied {
+        if !migrator.iter().any(|m| m.version == version) {
+            tracing::warn!(
+                version,
+                "the database holds a migration this build does not know (a rolled-back image?)"
+            );
+        }
+    }
 
     let (version,): (String,) = sqlx::query_as("SELECT sqlite_version()")
         .fetch_one(&pool)
