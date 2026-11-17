@@ -9,7 +9,7 @@ use crate::game::store::LoadedQuiz;
 use crate::game::tests::watcher;
 use crate::game::tests::{
     BASE, CLOSED, Client, World, adv, connect, connect_rc, ended_reason, kind, last_of, leave,
-    nothing_left, secs, settle, world_with,
+    nothing_left, restarted, secs, settle, wall_since, world_with,
 };
 use crate::grading::tests::question;
 use crate::model::QuestionKind;
@@ -1589,4 +1589,197 @@ async fn a_watcher_of_a_running_quest_gets_the_board_without_names_and_no_roster
     assert!(last_of(&f, 21).is_none(), "no roster");
     let board = last_of(&f, 29).expect("the live board");
     assert_eq!(board[1][0][0], json!(""), "no name on the board");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_quest_resumes_after_a_crash_with_its_coins_chests_pauses_and_clock() {
+    let start = Instant::now();
+    let q = Quest::new();
+    let (mut h, mut ps, firsts) = running(&q, 2, 0).await;
+    // p1 is right and has a chest to open, p2 is wrong and is thinking about it
+    q.chests(1, [Outcome::Coins(20); 3]);
+    reply(&ps[0], &firsts[0], right_mask(firsts[0].id)).await;
+    reply(&ps[1], &firsts[1], wrong_mask(firsts[1].id)).await;
+    settle().await;
+    let coins = verdict(&ps[0].frames()).unwrap()[6].as_i64().unwrap();
+    let ends_at = last_of(&h.frames(), 22).unwrap()[2].clone();
+    // the crash comes after the throttled write of the answers
+    adv(secs(4)).await;
+    assert_eq!(
+        q.w.store
+            .running
+            .lock()
+            .unwrap()
+            .values()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "a quest game is stored"
+    );
+
+    // the process dies; 20 s pass with nobody serving: p2's pause is over by then
+    let w2 = restarted(&q.w, wall_since(start) + 20_000).await;
+    adv(secs(1)).await;
+    let mut p1 = connect(&w2, "s1", "p1", Role::Player).await;
+    let mut p2 = connect(&w2, "s1", "p2", Role::Player).await;
+    let mut h = connect(&w2, "s1", "teacher", Role::Host).await;
+
+    let f = p1.frames();
+    let me = last_of(&f, 23).expect("p1's state");
+    assert_eq!(
+        (&me[1], &me[3], &me[7], &me[8]),
+        (&json!(coins), &json!(1), &json!(1), &json!(2)),
+        "coins, streak, serial and the chest waiting"
+    );
+    assert_eq!(
+        last_of(&h.frames(), 22).unwrap()[2],
+        ends_at,
+        "the same clock"
+    );
+    let f = p2.frames();
+    let me = last_of(&f, 23).expect("p2's state");
+    assert_eq!(
+        (&me[7], &me[8]),
+        (&json!(2), &json!(1)),
+        "the pause ended while down: the next question is open"
+    );
+
+    p1.send(ClientFrame::QuestPick {
+        serial: 1,
+        chest: 0,
+    })
+    .await;
+    settle().await;
+    assert_eq!(
+        chest_result(&p1.frames()).unwrap()[5],
+        json!(coins + 20),
+        "the chest they had is opened"
+    );
+
+    // the clock runs out and the game ends with the coins it had
+    adv(secs(280)).await;
+    assert!(last_of(&p1.frames(), 6).is_some(), "the podium");
+    h.send(ClientFrame::End).await;
+    settle().await;
+    assert!(w2.store.running.lock().unwrap().is_empty(), "the row went");
+    let batches = w2.store.batches.lock().unwrap();
+    let last = batches.last().unwrap();
+    assert!(last.ended_at.is_some());
+    assert_eq!(last.players.iter().map(|p| p.score).max(), Some(coins + 20));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_planned_stop_does_not_cost_a_quest_player_answering_time() {
+    let start = Instant::now();
+    let q = Quest::new();
+    let (mut h, mut ps, firsts) = running(&q, 2, 0).await;
+    q.chests(1, [Outcome::Coins(20); 3]);
+    // p1 is right (a chest waits) and p2 is wrong (a pause runs) when the service stops
+    reply(&ps[0], &firsts[0], right_mask(firsts[0].id)).await;
+    reply(&ps[1], &firsts[1], wrong_mask(firsts[1].id)).await;
+    settle().await;
+    ps[0].frames();
+    let ends_at = last_of(&h.frames(), 22).unwrap()[2].as_i64().unwrap();
+    q.w.deps.rooms.shutdown(secs(5)).await;
+
+    // 60 s down: far more than the pause (2.5 s) and the time of a question
+    let w2 = restarted(&q.w, wall_since(start) + 60_000).await;
+    let mut p1 = connect(&w2, "s1", "p1", Role::Player).await;
+    let mut p2 = connect(&w2, "s1", "p2", Role::Player).await;
+    let mut h = connect(&w2, "s1", "teacher", Role::Host).await;
+    let f = p1.frames();
+    assert_eq!(
+        last_of(&f, 23).unwrap()[8],
+        json!(2),
+        "the chest is still there"
+    );
+    let f = p2.frames();
+    let me = last_of(&f, 23).unwrap();
+    assert_eq!(
+        (&me[7], &me[8]),
+        (&json!(1), &json!(3)),
+        "the pause had not run out: it goes on"
+    );
+    let pause_ms = me[9].as_i64().unwrap();
+    assert!(
+        (20_000..22_500).contains(&pause_ms),
+        "the penalty and the allowance: a pause that ended while its player was away serves them a timed question ({pause_ms})"
+    );
+    let pushed = last_of(&h.frames(), 22).unwrap()[2].as_i64().unwrap() - ends_at;
+    assert!(
+        (80_000..80_100).contains(&pushed),
+        "the game's clock stood still too ({pushed})"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_quest_snapshot_of_500_players_and_100_questions_is_small_and_quick_to_encode() {
+    use crate::game::resume::Saved;
+    let long = |n: usize| "x".repeat(n);
+    let questions: Vec<_> = (0..100)
+        .map(|i| {
+            let options: Vec<(i64, bool)> = (0..6).map(|o| (1_000 * i + o, o == 0)).collect();
+            let mut q = question(i, QuestionKind::Single, 20, &options);
+            q.question.text = long(500);
+            q.question.explanation = Some(long(500));
+            for o in &mut q.options {
+                o.text = long(200);
+            }
+            q
+        })
+        .collect();
+    let mut game = super::Quest::new(
+        1,
+        "big".into(),
+        "teacher".into(),
+        Arc::new(questions),
+        300,
+        false,
+        Box::new(SeededDraw(3)),
+        Instant::now(),
+        Instant::now(),
+    );
+    for n in 0..500 {
+        game.join(&format!("user-{n}"), &format!("Player number {n}"), BASE)
+            .unwrap();
+    }
+    let started = std::time::Instant::now();
+    let snap = game.snap(|_| BASE);
+    let row = Saved {
+        quiz_id: 1,
+        paused_at: None,
+        game: crate::game::resume::SavedGame::Quest(snap),
+    }
+    .row("s1", BASE)
+    .unwrap();
+    let took = started.elapsed();
+    eprintln!(
+        "snapshot of 500 players, 100 questions (worst-case text): {} bytes, {:?}",
+        row.snapshot.len(),
+        took
+    );
+    assert!(
+        row.snapshot.len() < 1_000_000,
+        "{} bytes",
+        row.snapshot.len()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_that_ends_while_its_player_is_away_serves_them_the_next_question() {
+    let start = Instant::now();
+    let q = Quest::new();
+    let (_h, ps, firsts) = running(&q, 2, 0).await;
+    reply(&ps[1], &firsts[1], wrong_mask(firsts[1].id)).await;
+    settle().await;
+    q.w.deps.rooms.shutdown(secs(5)).await;
+
+    // the player is back after the penalty and the allowance: the question was served at
+    // the end of the pause, so that is why the allowance is on the pause
+    let w2 = restarted(&q.w, wall_since(start) + 1_000).await;
+    adv(secs(25)).await;
+    let mut p2 = connect(&w2, "s1", "p2", Role::Player).await;
+    let f = p2.frames();
+    let me = last_of(&f, 23).unwrap();
+    assert_eq!((&me[7], &me[8]), (&json!(2), &json!(1)));
 }

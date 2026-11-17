@@ -2,3 +2,4 @@
 
 pub mod games;
 pub mod quizzes;
+pub mod running;

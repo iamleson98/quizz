@@ -10,6 +10,7 @@ use crate::error::{AppError, AppResult};
 use crate::grading::tests::question;
 use crate::model::QuestionKind;
 use crate::repo::games::{Batch, NewGame};
+use crate::repo::running::RunningRow;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -27,6 +28,16 @@ pub(crate) struct FakeStore {
     pub(crate) games: Mutex<Vec<NewGame>>,
     pub(crate) batches: Mutex<Vec<Batch>>,
     pub(crate) fail_writes: Mutex<bool>,
+    /// The stored running games, by room.
+    pub(crate) running: Mutex<HashMap<String, RunningRow>>,
+    /// How many times a running game was stored.
+    pub(crate) running_writes: Mutex<u32>,
+    /// Storing and deleting a running game fails.
+    pub(crate) fail_running: Mutex<bool>,
+    /// How many times storing or deleting a running game was tried, failed or not.
+    pub(crate) running_tries: Mutex<u32>,
+    /// How long storing a running game takes.
+    pub(crate) save_delay: Mutex<Duration>,
 }
 
 impl GameStore for FakeStore {
@@ -53,6 +64,46 @@ impl GameStore for FakeStore {
             }
             self.batches.lock().unwrap().push(batch);
             Ok(())
+        })
+    }
+    fn save_running(&self, row: RunningRow) -> BoxFuture<'_, AppResult<()>> {
+        Box::pin(async move {
+            let delay = *self.save_delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
+            *self.running_tries.lock().unwrap() += 1;
+            if *self.fail_running.lock().unwrap() {
+                return Err(AppError::Internal("disk".into()));
+            }
+            *self.running_writes.lock().unwrap() += 1;
+            self.running.lock().unwrap().insert(row.room.clone(), row);
+            Ok(())
+        })
+    }
+    fn delete_running(&self, room: String, game_id: i64) -> BoxFuture<'_, AppResult<()>> {
+        Box::pin(async move {
+            *self.running_tries.lock().unwrap() += 1;
+            if *self.fail_running.lock().unwrap() {
+                return Err(AppError::Internal("disk".into()));
+            }
+            let mut running = self.running.lock().unwrap();
+            if running.get(&room).is_some_and(|r| r.game_id == game_id) {
+                running.remove(&room);
+            }
+            Ok(())
+        })
+    }
+    fn load_running(&self) -> BoxFuture<'_, AppResult<Vec<RunningRow>>> {
+        Box::pin(async move {
+            let ended = |game_id: i64| {
+                self.batches
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|b| b.game_id == game_id && b.ended_at.is_some())
+            };
+            let mut running = self.running.lock().unwrap();
+            running.retain(|_, r| !ended(r.game_id));
+            Ok(running.values().cloned().collect())
         })
     }
 }
@@ -106,6 +157,31 @@ pub(crate) fn world_with(
         quest_draw,
     };
     World { store, deps }
+}
+
+/// What a new process finds after the old one stopped: the same quizzes, results and stored
+/// running games, a clock at `now_ms`, and no rooms but the ones it puts back.
+pub(crate) async fn restarted(w: &World, now_ms: i64) -> World {
+    let store = Arc::new(FakeStore::default());
+    *store.quizzes.lock().unwrap() = w.store.quizzes.lock().unwrap().clone();
+    *store.games.lock().unwrap() = w.store.games.lock().unwrap().clone();
+    *store.batches.lock().unwrap() = w.store.batches.lock().unwrap().clone();
+    *store.running.lock().unwrap() = w.store.running.lock().unwrap().clone();
+    let deps = Deps {
+        store: store.clone(),
+        now_ms: Arc::new(move || now_ms),
+        rooms: Rooms::default(),
+        quest_draw: w.deps.quest_draw.clone(),
+    };
+    super::resume::restore(&deps).await.expect("restore");
+    settle().await;
+    World { store, deps }
+}
+
+/// The wall clock of a test that started at `since`: the tests' clock is `BASE` plus the
+/// virtual time that has passed.
+pub(crate) fn wall_since(since: Instant) -> i64 {
+    BASE + since.elapsed().as_millis() as i64
 }
 
 pub(crate) struct Client {
@@ -1838,17 +1914,18 @@ async fn a_player_back_within_the_grace_can_still_answer_and_closes_the_question
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_shutdown_mid_question_scores_and_stores_the_answers_given() {
+async fn a_room_closing_mid_question_scores_and_stores_the_answers_given() {
     let w = world();
-    let p1 = player(&w, 1).await;
-    let p2 = player(&w, 2).await;
-    let h = host(&w).await;
+    let rc = BASE + 10_000;
+    let p1 = connect_rc(&w, "p1", Role::Player, rc).await;
+    let p2 = connect_rc(&w, "p2", Role::Player, rc).await;
+    let h = connect_rc(&w, "teacher", Role::Host, rc).await;
     h.send(ClientFrame::Start(1)).await;
     h.send(ClientFrame::Next).await;
     settle().await;
     answer(&p1, 1, 0b0010).await;
     settle().await;
-    w.deps.rooms.shutdown(secs(5)).await;
+    adv(secs(11)).await;
     assert_eq!(ended_writes(&w), 1);
     assert_eq!(stored_answers(&w), 1, "the one answer given was stored");
     drop((p2, h));
@@ -1857,14 +1934,17 @@ async fn a_shutdown_mid_question_scores_and_stores_the_answers_given() {
 #[tokio::test(start_paused = true)]
 async fn a_shutdown_waits_for_a_final_write_that_is_still_being_tried() {
     let w = world();
-    let p1 = player(&w, 1).await;
-    let h = host(&w).await;
+    let rc = BASE + 10_000;
+    let p1 = connect_rc(&w, "p1", Role::Player, rc).await;
+    let h = connect_rc(&w, "teacher", Role::Host, rc).await;
     h.send(ClientFrame::Start(1)).await;
     h.send(ClientFrame::Next).await;
     settle().await;
     answer(&p1, 1, 0b0010).await;
     settle().await;
+    // the room closes with the question open and the database failing
     *w.store.fail_writes.lock().unwrap() = true;
+    adv(secs(11)).await;
     let store = w.store.clone();
     let back = tokio::spawn(async move {
         tokio::time::sleep(secs(2)).await;

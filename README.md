@@ -243,9 +243,30 @@ other teachers' scoreboards. The LMS server calls it when an account is deleted.
   forge them; if the public listener were reachable some other way they could be
   forged, and the peer address would be the only honest one.
 - **One replica.** The SQLite file takes an exclusive lock (`unix-excl`), so
-  deploy with strategy `Recreate`. Restarting ends running games (the teacher
-  starts the game again); everything already written stays. On `SIGTERM` the
-  service ends games, closes sockets (1001) and exits.
+  deploy with strategy `Recreate`. Running games survive a restart: each room's
+  game is stored in `running_games` (one row, a versioned snapshot; written at
+  every phase change and within 3 s of any other change, off the room's task) and
+  put back before the service accepts sockets, so a deploy, an eviction or a kill
+  mid-game costs the players a reconnect and nothing else (what happened in the
+  last 3 s of a phase may be lost after a hard kill). On `SIGTERM` the service
+  writes every running game once more, closes sockets (1001) and exits without
+  ending them. A row is deleted when its game ends, and one not written for a day
+  is swept.
+- **A planned stop does not cost answering time.** A game written at `SIGTERM` is
+  marked paused: when the next process puts it back, the question clocks and a
+  quest's game clock are pushed on by the time it was down plus a 20 s reconnect
+  allowance (web clients retry every 8 to 12 s), and a player who has not come
+  back keeps counting toward closing a question for that allowance. The state is
+  then written again, no longer paused. After a crash there is no such mark, and
+  the clocks keep wall-clock time (a question that ran out while the service was
+  down closes at once; the usual 10 s grace applies).
+- **Rolling back the image.** From this build on the service starts on a database
+  that a newer build has migrated (`set_ignore_missing`). The build before it does
+  not, so rolling back past migration 2 needs this first, on the database
+  (`quiz.db`, from a snapshot or with `QUIZ_SQLITE_VFS=unix`), with the service
+  stopped:
+  `DROP INDEX idx_answers_player_question; DROP TABLE running_games; DELETE FROM _sqlx_migrations WHERE version = 2;`
+  Running games are then lost, as before this migration.
 - **Snapshots.** Every `QUIZ_SNAPSHOT_INTERVAL_SECS`, when anything changed, the
   database is copied with `VACUUM INTO` to `quiz.db.tmp` in `QUIZ_SNAPSHOT_DIR`,
   fsynced and renamed over `quiz.db` (atomic; works with the default

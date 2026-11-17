@@ -5,6 +5,7 @@
 use crate::error::AppResult;
 use crate::model::QuestionWithOptions;
 use crate::repo::games::{Batch, NewGame};
+use crate::repo::running::{self, RunningRow};
 use crate::repo::{games, quizzes};
 use crate::state::AppState;
 use crate::tx;
@@ -65,6 +66,14 @@ pub trait GameStore: Send + Sync + 'static {
     fn create_game(&self, game: NewGame) -> BoxFuture<'_, AppResult<()>>;
     /// Write players and answers (and the end of the game when asked).
     fn write(&self, batch: Batch) -> BoxFuture<'_, AppResult<()>>;
+    /// Store the state of a room's running game, replacing the one before it.
+    fn save_running(&self, row: RunningRow) -> BoxFuture<'_, AppResult<()>>;
+    /// Forget a room's running game, if the row is still that game's (the room may host
+    /// the next one already).
+    fn delete_running(&self, room: String, game_id: i64) -> BoxFuture<'_, AppResult<()>>;
+    /// Every stored running game that is still running (what a restart puts back); the rows
+    /// of games that ended are deleted.
+    fn load_running(&self) -> BoxFuture<'_, AppResult<Vec<RunningRow>>>;
 }
 
 /// The store over the service's SQLite.
@@ -102,6 +111,36 @@ impl GameStore for DbStore {
                 Box::pin(async move { games::write_batch(conn, &batch).await })
             })
             .await
+        })
+    }
+
+    fn save_running(&self, row: RunningRow) -> BoxFuture<'_, AppResult<()>> {
+        Box::pin(async move {
+            tx::write_tx(&self.state, move |conn| {
+                let row = row.clone();
+                Box::pin(async move { running::save(conn, &row).await })
+            })
+            .await
+        })
+    }
+
+    fn delete_running(&self, room: String, game_id: i64) -> BoxFuture<'_, AppResult<()>> {
+        Box::pin(async move {
+            tx::write_tx(&self.state, move |conn| {
+                let room = room.clone();
+                Box::pin(async move { running::delete(conn, &room, game_id).await })
+            })
+            .await
+        })
+    }
+
+    fn load_running(&self) -> BoxFuture<'_, AppResult<Vec<RunningRow>>> {
+        Box::pin(async move {
+            tx::write_tx(&self.state, |conn| {
+                Box::pin(async move { running::drop_ended(conn).await })
+            })
+            .await?;
+            running::all(&self.state.pool).await
         })
     }
 }

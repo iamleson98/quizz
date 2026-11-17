@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use common::*;
 use futures::{SinkExt, StreamExt};
 use quiz_service::auth::Role;
+use quiz_service::config::Config;
 use quiz_service::game::registry::Counts;
 use quiz_service::server::public_router;
 use quiz_service::state::AppState;
@@ -30,7 +31,15 @@ struct Service {
 }
 
 async fn serve(extra: &[(&str, String)]) -> Service {
-    let state = setup_with(extra).await;
+    serve_over(config_with(extra)).await
+}
+
+/// A service as `main` builds it: the stored running games are back before the first socket.
+async fn serve_over(cfg: Config) -> Service {
+    let state = AppState::connect(cfg).await.expect("connect test db");
+    quiz_service::game::resume::restore(state.deps())
+        .await
+        .expect("restore");
     let router = public_router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -434,31 +443,124 @@ impl IntoPair for (Ws, Value) {
     }
 }
 
+/// A new process over the same database: the old one is told to stop (its games are written
+/// down, not ended), and the new one puts them back before it serves.
+async fn restart(old: Service) -> Service {
+    old.state.rooms.shutdown(Duration::from_secs(5)).await;
+    serve_over(old.state.cfg.clone()).await
+}
+
 #[tokio::test]
-async fn shutdown_ends_a_running_game_and_closes_it_in_the_database() {
+async fn a_restart_puts_running_games_back_and_they_finish() {
     let s = serve(&[]).await;
-    let quiz_id = s.quiz("teacher1").await;
+    // a race in room s1 with one answer given, a quest in room s2 with coins and a chest to open
+    let race_quiz = s.quiz("teacher1").await;
     let (mut host, _) = s.join(&host_ticket(&s, "teacher1")).await;
-    let (mut p, _) = s.join(&player_ticket(&s, "student1")).await;
-    send(&mut host, json!([1, quiz_id])).await;
+    let ptoken = player_ticket(&s, "student1");
+    let (mut p, _) = s.join(&ptoken).await;
+    let (_other, _) = s.join(&player_ticket(&s, "student2")).await;
+    send(&mut host, json!([1, race_quiz])).await;
     recv_kind(&mut p, 1).await;
     send(&mut host, json!([2])).await;
     recv_kind(&mut p, 2).await;
+    send(&mut p, json!([4, 1, 1])).await;
+    recv_kind(&mut p, 9).await;
 
-    s.state.rooms.shutdown(Duration::from_secs(5)).await;
-    assert_eq!(
-        recv_kind(&mut p, 7).await,
-        json!([7, 3]),
-        "the game ended because the service restarts"
-    );
-    assert_eq!(close_of(&mut p).await, Some((1001, "restart".into())));
-    assert_eq!(close_of(&mut host).await, Some((1001, "restart".into())));
-    settled(&s).await;
-    let ended: Option<i64> = sqlx::query_scalar("SELECT ended_at FROM games")
+    let quest_quiz = s.quiz("teacher2").await;
+    let qhost_token = ticket_for(&s.state, Role::Host, "teacher2", "s2");
+    let qtoken = ticket_for(&s.state, Role::Player, "student3", "s2");
+    let (mut qhost, _) = s.join(&qhost_token).await;
+    let (mut q, _) = s.join(&qtoken).await;
+    send(&mut qhost, json!([1, quest_quiz, 1, 300, 1])).await;
+    recv_kind(&mut q, 20).await;
+    send(&mut qhost, json!([2])).await;
+    let question = recv_kind(&mut q, 24).await;
+    let mask = match question[2].as_str().unwrap() {
+        "1/2 + 1/2 = ?" | "0.5 = 1/2" => 1,
+        "Which are prime?" => 0b0101,
+        other => panic!("unexpected question {other}"),
+    };
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    send(&mut q, json!([6, question[5], mask])).await;
+    let coins = recv_kind(&mut q, 25).await[6].as_i64().unwrap();
+    assert!(coins >= 10);
+
+    let s = restart(s).await;
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM running_games")
         .fetch_one(&s.state.pool)
         .await
         .unwrap();
-    assert!(ended.is_some(), "the game was closed in the database");
+    assert_eq!(stored, 2, "both games were written down");
+    assert_eq!(s.state.rooms.counts().running_games, 2, "and put back");
+
+    // the race: the player is the same player, with the answer they gave
+    let (mut again, first) = s.join(&ptoken).await;
+    assert_eq!(first[0], 2, "the question as it stands");
+    assert_eq!(first.as_array().unwrap().last().unwrap(), &json!(1));
+    let (mut host, _) = s.join(&host_ticket(&s, "teacher1")).await;
+    send(&mut host, json!([3])).await;
+    send(&mut host, json!([3])).await; // the podium first, then the end
+    assert_eq!(recv_kind(&mut again, 7).await, json!([7, 0]));
+
+    // the quest: the coins, and the chest still to open
+    let (mut q, _) = s.join(&qtoken).await;
+    let me = recv_kind(&mut q, 23).await;
+    assert_eq!(
+        (me[1].as_i64().unwrap(), me[8].as_i64().unwrap()),
+        (coins, 2)
+    );
+    send(&mut q, json!([7, question[5], 0])).await;
+    assert_eq!(recv_kind(&mut q, 26).await[6].as_array().unwrap().len(), 6);
+    let (mut qhost, _) = s.join(&qhost_token).await;
+    send(&mut qhost, json!([3])).await;
+    send(&mut qhost, json!([3])).await; // the podium first, then the end
+    assert_eq!(recv_kind(&mut q, 7).await, json!([7, 0]));
+
+    // both are over: no state left, nothing running, both stored as ended
+    let end = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM running_games")
+            .fetch_one(&s.state.pool)
+            .await
+            .unwrap();
+        if stored == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < end,
+            "the rows were not deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let unended: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM games WHERE ended_at IS NULL")
+        .fetch_one(&s.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(unended, 0);
+    let answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM answers")
+        .fetch_one(&s.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        answers, 1,
+        "the answer given before the stop is in the results, once"
+    );
+}
+
+#[tokio::test]
+async fn a_socket_that_arrives_while_the_service_stops_is_told_to_come_back() {
+    let s = serve(&[]).await;
+    let (_host, _) = s.join(&host_ticket(&s, "teacher1")).await;
+    s.state.rooms.shutdown(Duration::from_secs(5)).await;
+    let token = player_ticket(&s, "student1");
+    let mut ws = s.open(&token).await;
+    send(&mut ws, json!([0, token])).await;
+    assert_eq!(close_of(&mut ws).await, Some((1001, "restart".into())));
+    assert_eq!(
+        s.state.rooms.counts().rooms,
+        0,
+        "it did not start a room of its own in the dying process"
+    );
 }
 
 #[tokio::test]

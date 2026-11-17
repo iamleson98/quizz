@@ -7,8 +7,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::info;
 
-/// How long the service waits on shutdown for rooms to end their games and for the final
-/// writes to land. With the 5 s for the sockets after it, this stays inside Kubernetes'
+/// How long the service waits on shutdown for rooms to write the state of their games and for
+/// the final writes to land. With the 5 s for the sockets after it, this stays inside Kubernetes'
 /// default 30 s termination grace.
 const SHUTDOWN_ROOMS_WITHIN: Duration = Duration::from_secs(20);
 
@@ -54,6 +54,17 @@ async fn run(cfg: Config) -> Result<(), String> {
         "quiz-service starting"
     );
 
+    // Games that were running when the last process stopped are back in their rooms before
+    // anybody can connect (and before the startup sweep closes the games that are not).
+    match quiz_service::game::resume::restore(state.deps()).await {
+        Ok(r) => info!(
+            resumed = r.resumed,
+            refused = r.refused,
+            "running games restored"
+        ),
+        Err(e) => return Err(format!("cannot restore the running games: {e}")),
+    }
+
     let public = bind(&cfg.listen_addr).await?;
     let internal = bind(&cfg.internal_addr).await?;
 
@@ -90,7 +101,7 @@ async fn run(cfg: Config) -> Result<(), String> {
     ));
 
     shutdown_signal().await;
-    // Games end before the sockets go.
+    // The state of every running game is written before the sockets go.
     state.rooms.shutdown(SHUTDOWN_ROOMS_WITHIN).await;
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), async {

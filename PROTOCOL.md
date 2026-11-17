@@ -70,7 +70,7 @@ reports time.
 | 5 | `[5,q,correct,[counts],explanation,[["name",score]...],score,rank,points,right,mine,streak,bonus]` | **reveal** of question `q` |
 | 6 | `[6,[["name",score]...(3)],score,rank]` | **podium** for a player |
 | 6 | `[6,[["name",score]...(3)],[["name",score]...(all)]]` | **podium** for the host |
-| 7 | `[7,reason]` | **ended**: `0` the host ended it, `1` the room closed (the ticket's `rc`), `2` idle (an hour without a command, or nobody connected for 5 minutes), `3` the service is restarting, `4` the host left (no host socket for 2 minutes) |
+| 7 | `[7,reason]` | **ended**: `0` the host ended it, `1` the room closed (the ticket's `rc`), `2` idle (an hour without a command, or nobody connected for 5 minutes), `3` retired (a restart no longer ends a game), `4` the host left (no host socket for 2 minutes) |
 | 8 | `[8,code,request]` | **error** for a client frame of type `request` (`0` for hello) |
 | 9 | `[9]` | **ack**: your answer is locked in |
 | 10 | `[10,["name",...]]` | **names** (host only): display names of players who joined the room |
@@ -238,8 +238,36 @@ server, so a wrong client clock cannot buy points.
   socket is open. When the host left a game that was being played, it goes to
   the podium first (the open question is closed and stored, as for the host's
   `end`), then `[7,4]`; a lobby just ends. The results are stored once. Clients
-  show "the host left" and return to the board. A deploy of the service ends
-  running games (reason `3`) and closes sockets with 1001 "restart".
+  show "the host left" and return to the board.
+- **A restart does not end a game.** The service writes the state of every
+  running game to its database (at every phase change, and within 3 s of any
+  change inside a phase), and on `SIGTERM` it writes them once more and closes
+  every socket with 1001 "restart" **without** an `ended` frame. The next process
+  puts the games back before it accepts a socket, with their deadlines as they
+  were. Clients reconnect as they do after any lost socket, with a fresh ticket
+  for the same user, and `hello` brings them up to date: the host is the host, a
+  player is the same player with the same score, answer and coins.
+  - **A planned stop** (`SIGTERM`, a deploy) marks the written state as paused.
+    The next process pushes the question clocks, a quest's game clock and its
+    pauses on by the time the service was down **plus a 20 s reconnect allowance**
+    (web clients retry every 8 to 12 s), so the stop costs nobody answering time.
+    A player who has not come back keeps counting toward closing a question for
+    that allowance, as if their socket had just dropped, and stops after it. A
+    quest player's wrong-answer pause gets the allowance too, on purpose: when a
+    pause ends the server serves its player the next timed question whether or
+    not they are connected, so a pause that ended while they were still
+    reconnecting would start their clock before they could see it. A player back
+    early therefore waits out up to 20 s more than their penalty. The state is
+    written again at once, no longer paused.
+  - **A crash** (a kill, an out-of-memory) has no pause: the clocks are
+    wall-clock, so a question or pause whose time ran out while the service was
+    down has run out (the question closes at once), a quest's clock keeps
+    running, and what happened in the last 3 s of a phase may be lost. The grace of
+    a player who has not come back is the usual 10 s.
+
+  A player or host who does not come back is treated as one who lost their
+  connection (then reason `2` or `4`). Games that cannot be put back (a snapshot of another version, or
+  unreadable) are closed in the results.
 - **Every socket is closed 20 s after its ticket's `rc`**, with close code 1001
   and reason "room closed", whether a game is running or not, host or player.
   The game has already ended at `rc` (`[7,1]`, results stored) and the frames

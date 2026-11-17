@@ -3,6 +3,7 @@
 
 use crate::error::{AppError, AppResult};
 use crate::retention::{KEPT_QUIZ_TTL_MS, RESULTS_TTL_MS, UNKEPT_QUIZ_TTL_MS};
+use serde::{Deserialize, Serialize};
 use sqlx::{Executor, Sqlite, SqliteConnection};
 use std::collections::HashMap;
 
@@ -35,7 +36,7 @@ pub struct PlayerWrite {
 }
 
 /// One answer, written when its question closes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnswerWrite {
     pub id: i64,
     pub player_id: i64,
@@ -116,7 +117,7 @@ pub async fn write_batch(conn: &mut SqliteConnection, batch: &Batch) -> AppResul
     }
     for a in &batch.answers {
         sqlx::query(
-            "INSERT INTO answers (id, game_id, player_id, question_id, selected, correct, credit, points, bonus, time_ms)
+            "INSERT OR IGNORE INTO answers (id, game_id, player_id, question_id, selected, correct, credit, points, bonus, time_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(a.id)

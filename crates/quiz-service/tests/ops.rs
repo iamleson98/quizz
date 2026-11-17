@@ -7,6 +7,7 @@ use common::*;
 use quiz_service::auth::Role;
 use quiz_service::game::store::{DbStore, GameStore};
 use quiz_service::repo::games::{AnswerWrite, Batch, NewGame, PlayerWrite};
+use quiz_service::repo::running::RunningRow;
 use quiz_service::retention::{self, KEPT_QUIZ_TTL_MS, RESULTS_TTL_MS, UNKEPT_QUIZ_TTL_MS};
 use quiz_service::server::{internal_router, public_router};
 use quiz_service::snapshot::{Outcome, Snapshotter};
@@ -616,4 +617,235 @@ async fn the_database_size_is_measured_with_its_wal() {
         quiz_service::db::size_bytes(std::path::Path::new("/no/such/file")),
         0
     );
+}
+
+#[tokio::test]
+async fn a_game_with_stored_state_is_not_an_orphan_until_that_state_is_a_day_old() {
+    let state = setup().await;
+    let router = public_router(state.clone());
+    let t = ticket(&state, Role::Teacher, "teacher1");
+    let quiz = post(&router, "/v1/quizzes", &t, quiz_body("q")).await.body;
+    let quiz_id: i64 = quiz["id"].as_str().unwrap().parse().unwrap();
+    let store = DbStore {
+        state: state.clone(),
+    };
+    let mut ids = Vec::new();
+    for room in ["resumable", "lost"] {
+        let id = quiz_service::ids::new_id();
+        store
+            .create_game(NewGame {
+                id,
+                quiz_id,
+                session_id: room.into(),
+                class_id: "c".into(),
+                host_id: "teacher1".into(),
+                started_at: state.now_ms(),
+                mode: 0,
+            })
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    store
+        .save_running(RunningRow {
+            room: "resumable".into(),
+            game_id: ids[0],
+            kind: 0,
+            version: 1,
+            snapshot: b"{}".to_vec(),
+            updated_at: state.now_ms(),
+        })
+        .await
+        .unwrap();
+    let open = |id: i64| {
+        let state = state.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<i64>>("SELECT ended_at FROM games WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap()
+                .is_none()
+        }
+    };
+
+    // at startup, after the stored games were put back: only the one without state is closed
+    let closed = retention::close_orphaned_games(&state, state.now_ms())
+        .await
+        .unwrap();
+    assert_eq!(closed, 1);
+    assert!(open(ids[0]).await, "the game with a stored state runs on");
+    assert!(!open(ids[1]).await);
+
+    // a game that ended before its row was deleted is not given back, and its row goes
+    store
+        .save_running(RunningRow {
+            room: "lost".into(),
+            game_id: ids[1],
+            kind: 0,
+            version: 1,
+            snapshot: b"{}".to_vec(),
+            updated_at: state.now_ms(),
+        })
+        .await
+        .unwrap();
+    let rows = store.load_running().await.unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.room.as_str()).collect::<Vec<_>>(),
+        ["resumable"]
+    );
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM running_games")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 1);
+
+    // a day later nothing can still be playing: the state goes and so does its game
+    state.clock.advance_ms(DAY + 1_000);
+    let swept = retention::sweep(&state, state.now_ms()).await.unwrap();
+    assert_eq!(swept.running_games, 1);
+    assert!(!open(ids[0]).await, "the game was closed in the results");
+    assert!(store.load_running().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_replayed_question_close_does_not_write_its_answers_twice() {
+    let state = setup().await;
+    let router = public_router(state.clone());
+    let t = ticket(&state, Role::Teacher, "teacher1");
+    let quiz = post(&router, "/v1/quizzes", &t, quiz_body("q")).await.body;
+    let quiz_id: i64 = quiz["id"].as_str().unwrap().parse().unwrap();
+    let question_id: i64 =
+        sqlx::query_scalar("SELECT id FROM questions WHERE quiz_id = ?1 LIMIT 1")
+            .bind(quiz_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    let store = DbStore {
+        state: state.clone(),
+    };
+    let game_id = quiz_service::ids::new_id();
+    store
+        .create_game(NewGame {
+            id: game_id,
+            quiz_id,
+            session_id: "s".into(),
+            class_id: "c".into(),
+            host_id: "teacher1".into(),
+            started_at: state.now_ms(),
+            mode: 0,
+        })
+        .await
+        .unwrap();
+    // the close of a question, written; then the process died before its snapshot, and the
+    // game put back closes the same question again, with answer ids of its own
+    let close = |answer_id: i64| Batch {
+        game_id,
+        players: vec![PlayerWrite {
+            id: 7,
+            user_id: Some("student1".into()),
+            name: "n".into(),
+            joined_at: 0,
+            score: 1000,
+            total_ms: 1,
+            correct_count: 1,
+            answered: 1,
+            best_streak: 1,
+        }],
+        answers: vec![AnswerWrite {
+            id: answer_id,
+            player_id: 7,
+            question_id,
+            selected: vec![1],
+            correct: true,
+            credit: 1.0,
+            points: 1000,
+            bonus: 0,
+            time_ms: 1,
+        }],
+        ended_at: None,
+    };
+    store.write(close(11)).await.unwrap();
+    store.write(close(22)).await.unwrap();
+    // and a retry of a write that had committed carries the very same ids
+    store.write(close(11)).await.unwrap();
+    let answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM answers")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(answers, 1);
+}
+
+#[tokio::test]
+async fn the_migration_that_makes_answers_unique_first_removes_the_duplicates() {
+    let state = setup().await;
+    let router = public_router(state.clone());
+    let t = ticket(&state, Role::Teacher, "teacher1");
+    let quiz = post(&router, "/v1/quizzes", &t, quiz_body("q")).await.body;
+    let quiz_id: i64 = quiz["id"].as_str().unwrap().parse().unwrap();
+    let question_id: i64 =
+        sqlx::query_scalar("SELECT id FROM questions WHERE quiz_id = ?1 LIMIT 1")
+            .bind(quiz_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    sqlx::raw_sql("DROP INDEX idx_answers_player_question; DROP TABLE running_games;")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let store = DbStore {
+        state: state.clone(),
+    };
+    let game_id = quiz_service::ids::new_id();
+    store
+        .create_game(NewGame {
+            id: game_id,
+            quiz_id,
+            session_id: "s".into(),
+            class_id: "c".into(),
+            host_id: "teacher1".into(),
+            started_at: state.now_ms(),
+            mode: 0,
+        })
+        .await
+        .unwrap();
+    store
+        .write(Batch {
+            game_id,
+            players: vec![PlayerWrite {
+                id: 7,
+                user_id: Some("student1".into()),
+                name: "n".into(),
+                joined_at: 0,
+                score: 0,
+                total_ms: 0,
+                correct_count: 0,
+                answered: 0,
+                best_streak: 0,
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for id in [5, 6, 7] {
+        sqlx::query(
+            "INSERT INTO answers (id, game_id, player_id, question_id, selected, correct, credit, points, time_ms)
+             VALUES (?1, ?2, 7, ?3, '[]', 1, 1.0, 1, 1)",
+        )
+        .bind(id)
+        .bind(game_id)
+        .bind(question_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::raw_sql(include_str!("../migrations/0002_running_games.sql"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let left: Vec<i64> = sqlx::query_scalar("SELECT id FROM answers")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, [5], "one answer stays (the lowest id)");
 }
