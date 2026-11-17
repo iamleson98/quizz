@@ -20,8 +20,8 @@ const LATE_WRITE_MAX_WAIT: Duration = Duration::from_secs(60);
 /// Keeps trying the last write of a game that has ended: its room has moved on (it may host
 /// the next game), so the results must not depend on the database being free at that
 /// moment. A batch is written in one transaction, so trying it again never stores part of
-/// it twice.
-pub fn write_later(store: Arc<dyn GameStore>, batch: Batch) {
+/// it twice. The caller hands the task to the rooms, so that a shutdown waits for it.
+pub fn write_later(store: Arc<dyn GameStore>, batch: Batch) -> tokio::task::JoinHandle<()> {
     metrics::counter!("quiz_late_writes_total").increment(1);
     tokio::spawn(async move {
         let mut wait = Duration::from_secs(1);
@@ -47,7 +47,7 @@ pub fn write_later(store: Arc<dyn GameStore>, batch: Batch) {
             game = batch.game_id,
             "the results of an ended game could not be written: they are lost"
         );
-    });
+    })
 }
 
 /// A quiz as a game plays it.

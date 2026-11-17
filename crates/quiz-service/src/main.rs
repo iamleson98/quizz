@@ -7,8 +7,10 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::info;
 
-/// How long the service waits for rooms to close on shutdown.
-const SHUTDOWN_ROOMS_WITHIN: Duration = Duration::from_secs(5);
+/// How long the service waits on shutdown for rooms to end their games and for the final
+/// writes to land. With the 5 s for the sockets after it, this stays inside Kubernetes'
+/// default 30 s termination grace.
+const SHUTDOWN_ROOMS_WITHIN: Duration = Duration::from_secs(20);
 
 fn main() {
     let cfg = match Config::from_env() {

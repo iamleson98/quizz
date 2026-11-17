@@ -48,6 +48,10 @@ pub const EMPTY_ROOM_LIMIT: Duration = Duration::from_secs(5 * 60);
 pub const OUT_QUEUE: usize = 8;
 /// The beat between a question closing and its reveal (the correct options
 /// and the ranking), in milliseconds. The host's `next` skips it.
+/// How long a player who has not answered still counts toward closing the open question early
+/// after their last socket went: a dropped connection (the server's own slow-socket close
+/// included) must not close the question on them before they can come back.
+pub const DISCONNECT_GRACE: Duration = Duration::from_secs(10);
 pub const REVEAL_DELAY_MS: u64 = 2500;
 /// Rows of the host's provisional ranking.
 pub const PROVISIONAL_TOP: usize = 10;
@@ -215,12 +219,21 @@ struct Player {
     answered: u32,
     /// Sockets of this player attached now.
     live: u32,
+    /// When the last socket of this player went, until they attach again.
+    gone_at: Option<Instant>,
     /// In the roster (a lobby player who left is not).
     active: bool,
     dirty: bool,
     /// 1-based rank at the last reveal; 0 until ranked.
     rank: u32,
     answer: Option<Answer>,
+}
+
+impl Player {
+    /// Connected, or gone for less than the grace.
+    fn present(&self, now: Instant) -> bool {
+        self.live > 0 || self.gone_at.is_some_and(|t| now < t + DISCONNECT_GRACE)
+    }
 }
 
 struct Game {
@@ -258,17 +271,30 @@ struct Game {
 }
 
 impl Game {
-    /// Active players that are connected, can answer this question, and
-    /// those among them who have.
-    fn answer_progress(&self) -> (usize, usize) {
+    /// Active players that are connected (or went less than [`DISCONNECT_GRACE`] ago), can
+    /// answer this question, and those among them who have.
+    fn answer_progress(&self, now: Instant) -> (usize, usize) {
         let (mut eligible, mut answered) = (0, 0);
         for p in &self.players {
-            if p.active && p.live > 0 && p.first_question <= self.qi {
+            if p.active && p.first_question <= self.qi && p.present(now) {
                 eligible += 1;
                 answered += p.answer.is_some() as usize;
             }
         }
         (eligible, answered)
+    }
+
+    /// The moment the first unanswered, disconnected player stops counting toward the early
+    /// close of the open question.
+    fn grace_wake(&self, now: Instant) -> Option<Instant> {
+        self.players
+            .iter()
+            .filter(|p| {
+                p.active && p.first_question <= self.qi && p.live == 0 && p.answer.is_none()
+            })
+            .filter_map(|p| p.gone_at.map(|t| t + DISCONNECT_GRACE))
+            .filter(|&t| t > now)
+            .min()
     }
 
     /// The provisional top ten while a question is open: every player's
@@ -419,6 +445,8 @@ impl Room {
         [
             g.filter(|g| g.phase == Phase::Question)
                 .map(|g| g.q_deadline),
+            g.filter(|g| g.phase == Phase::Question)
+                .and_then(|g| g.grace_wake(Instant::now())),
             g.filter(|g| g.phase == Phase::Closing).map(|g| g.reveal_at),
             g.map(|g| g.rc_at),
             g.map(|g| g.idle_at),
@@ -440,6 +468,15 @@ impl Room {
             .game
             .as_ref()
             .is_some_and(|g| g.phase == Phase::Question && now >= g.q_deadline)
+        {
+            self.close_question().await;
+        }
+        // a player who went has been away for the grace: the rest may have all answered
+        if self
+            .game
+            .as_ref()
+            .is_some_and(|g| g.phase == Phase::Question)
+            && self.all_answered()
         {
             self.close_question().await;
         }
@@ -713,6 +750,7 @@ impl Room {
             let p = &mut g.players[pid];
             p.live = p.live.saturating_sub(1);
             if p.live == 0 {
+                p.gone_at = Some(Instant::now());
                 if g.phase == Phase::Lobby && p.active {
                     p.active = false;
                     g.active_count -= 1;
@@ -730,7 +768,7 @@ impl Room {
 
     fn all_answered(&self) -> bool {
         self.game.as_ref().is_some_and(|g| {
-            let (eligible, answered) = g.answer_progress();
+            let (eligible, answered) = g.answer_progress(Instant::now());
             eligible > 0 && eligible == answered
         })
     }
@@ -954,6 +992,7 @@ fn join(g: &mut Game, user: &str, name: &str, wall: i64) -> AppResult<usize> {
     if let Some(&pid) = g.by_user.get(user) {
         let p = &mut g.players[pid];
         p.live += 1;
+        p.gone_at = None;
         if !p.active {
             p.active = true;
             p.first_question = first;
@@ -979,6 +1018,7 @@ fn join(g: &mut Game, user: &str, name: &str, wall: i64) -> AppResult<usize> {
         best_streak: 0,
         answered: 0,
         live: 1,
+        gone_at: None,
         active: true,
         dirty: true,
         rank: 0,
@@ -1453,13 +1493,15 @@ impl Room {
         if self.game.is_none() {
             return;
         }
-        if self
+        // the answers of the open or closed question are scored and stored before the end,
+        // as when the host ends the game
+        if let Some(phase) = self
             .game
             .as_ref()
-            .is_some_and(|g| g.phase == Phase::Closing)
+            .map(|g| g.phase)
+            .filter(|p| matches!(p, Phase::Question | Phase::Closing))
         {
-            // the answers of a closed question are scored before the end
-            self.reveal_question().await;
+            self.show_podium(phase).await;
         }
         let ended_at = self.now_wall();
         // the results were stored when the podium opened
@@ -1467,7 +1509,8 @@ impl Room {
             && !self.persist(Some(ended_at)).await
             && let Some((batch, _)) = self.take_batch(Some(ended_at))
         {
-            super::store::write_later(self.deps.store.clone(), batch);
+            let write = super::store::write_later(self.deps.store.clone(), batch);
+            self.deps.rooms.track_late_write(write);
         }
         self.game = None;
         for s in self.socks.values_mut() {

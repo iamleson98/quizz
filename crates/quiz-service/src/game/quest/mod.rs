@@ -1283,7 +1283,8 @@ impl Room {
         if !self.quest_store().await
             && let Some(batch) = self.quest_batch()
         {
-            crate::game::store::write_later(self.deps.store.clone(), batch);
+            let write = crate::game::store::write_later(self.deps.store.clone(), batch);
+            self.deps.rooms.track_late_write(write);
         }
         if self.quest.take().is_none() {
             return;

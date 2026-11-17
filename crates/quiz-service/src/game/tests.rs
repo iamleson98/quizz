@@ -1671,7 +1671,7 @@ async fn the_race_podium_ends_by_itself_after_an_hour_with_one_write() {
 
 // ----------------------------------------------- lifetime of sockets and rooms
 
-use super::room::{EMPTY_ROOM_LIMIT, HOST_AWAY_LIMIT, ROOM_CLOSE_GRACE};
+use super::room::{DISCONNECT_GRACE, EMPTY_ROOM_LIMIT, HOST_AWAY_LIMIT, ROOM_CLOSE_GRACE};
 
 pub(crate) const CLOSED: &str = "close:1001:room closed";
 
@@ -1787,6 +1787,96 @@ async fn a_host_away_for_two_minutes_ends_a_lobby_with_reason_4_and_a_host_back_
     );
     assert_eq!(ended_writes(&w), 1);
     assert!(w.deps.rooms.running_quiz_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_player_who_drops_mid_question_keeps_the_question_open_for_the_grace() {
+    let w = world();
+    let mut p1 = player(&w, 1).await;
+    let p2 = player(&w, 2).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    leave(&p2).await; // dropped before answering
+    answer(&p1, 1, 0b0010).await;
+    settle().await;
+    assert!(
+        last_of(&p1.frames(), 11).is_none(),
+        "open: p2 may come back"
+    );
+    adv(DISCONNECT_GRACE - secs(1)).await;
+    assert!(
+        last_of(&p1.frames(), 11).is_none(),
+        "still open in the grace"
+    );
+    adv(secs(2)).await;
+    assert!(
+        last_of(&p1.frames(), 11).is_some(),
+        "closed once the grace passed and everybody present answered"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_player_back_within_the_grace_can_still_answer_and_closes_the_question() {
+    let w = world();
+    let mut p1 = player(&w, 1).await;
+    let p2 = player(&w, 2).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    leave(&p2).await;
+    answer(&p1, 1, 0b0010).await;
+    adv(secs(5)).await;
+    let back = player(&w, 2).await;
+    adv(DISCONNECT_GRACE).await;
+    assert!(last_of(&p1.frames(), 11).is_none(), "p2 is connected again");
+    answer(&back, 1, 0b0010).await;
+    settle().await;
+    assert!(last_of(&p1.frames(), 11).is_some(), "everybody answered");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_mid_question_scores_and_stores_the_answers_given() {
+    let w = world();
+    let p1 = player(&w, 1).await;
+    let p2 = player(&w, 2).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&p1, 1, 0b0010).await;
+    settle().await;
+    w.deps.rooms.shutdown(secs(5)).await;
+    assert_eq!(ended_writes(&w), 1);
+    assert_eq!(stored_answers(&w), 1, "the one answer given was stored");
+    drop((p2, h));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_waits_for_a_final_write_that_is_still_being_tried() {
+    let w = world();
+    let p1 = player(&w, 1).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&p1, 1, 0b0010).await;
+    settle().await;
+    *w.store.fail_writes.lock().unwrap() = true;
+    let store = w.store.clone();
+    let back = tokio::spawn(async move {
+        tokio::time::sleep(secs(2)).await;
+        *store.fail_writes.lock().unwrap() = false;
+    });
+    w.deps.rooms.shutdown(secs(20)).await;
+    back.await.unwrap();
+    assert_eq!(
+        stored_answers(&w),
+        1,
+        "written before the shutdown returned"
+    );
 }
 
 #[tokio::test(start_paused = true)]

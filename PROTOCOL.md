@@ -81,8 +81,9 @@ Details:
   [Clock](#clock)). `kind` is `0` single choice, `1` multiple choice, `2`
   true/false. Options are listed in order; their position is their bit.
 - `endsAt` is the question's deadline on the server's clock. The server closes
-  the question at `endsAt`, when every connected player eligible to answer has
-  answered, or when the host sends `next`, whichever comes first.
+  the question at `endsAt`, when every player eligible to answer has
+  answered (a player whose last socket went still counts for 10 s, so a dropped
+  connection does not close the question on them), or when the host sends `next`, whichever comes first.
 - **Closed, then the beat, then the reveal.** The moment a question closes
   every socket (players and host) gets the tiny shared `[11,q]`: players lock
   their screen, the host shows "revealing". The reveal (`[5,...]`, which carries

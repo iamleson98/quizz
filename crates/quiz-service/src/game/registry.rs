@@ -61,6 +61,8 @@ struct Inner {
     next_room: AtomicU64,
     next_sock: AtomicU64,
     unknown: std::sync::atomic::AtomicUsize,
+    /// Final writes of ended games that are still being tried.
+    late_writes: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// All rooms. Cheap to clone.
@@ -295,11 +297,25 @@ impl Rooms {
         }
     }
 
-    /// End every game and close every socket, waiting at most `limit`.
+    /// Remember a final write that is still being tried (see [`super::store::write_later`]), so
+    /// that a shutdown waits for it.
+    pub fn track_late_write(&self, write: tokio::task::JoinHandle<()>) {
+        let mut writes = self.0.late_writes.lock().unwrap();
+        writes.retain(|w| !w.is_finished());
+        writes.push(write);
+    }
+
+    /// End every game and close every socket, then wait for the final writes that are still
+    /// being tried; all within `limit`.
     pub async fn shutdown(&self, limit: Duration) {
-        let all = futures::future::join_all(self.handles().into_iter().map(|h| async move {
-            h.shutdown().await;
-        }));
+        let all = async {
+            futures::future::join_all(self.handles().into_iter().map(|h| async move {
+                h.shutdown().await;
+            }))
+            .await;
+            let writes = std::mem::take(&mut *self.0.late_writes.lock().unwrap());
+            futures::future::join_all(writes).await;
+        };
         let _ = tokio::time::timeout(limit, all).await;
     }
 }
