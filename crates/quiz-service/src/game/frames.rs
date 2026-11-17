@@ -228,6 +228,46 @@ fn js(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
+/// What a read-only watcher is sent in place of `out`, which is a frame the
+/// host is sent, so that no name only the host sees leaves the service:
+/// nothing for the lists of names (types 10 and 21); the names blanked in the
+/// provisional ranking (4) and the quest board (29); the podium (6) cut to the
+/// top three twice (`[6,top3,top3]`: the host's form, without the full order).
+/// Every other frame is as it is. A reveal (5) is already the top five and has
+/// no personal part for a host, and the top rows keep their names: they are
+/// what the whole class sees, and the watcher's owner decides who may keep one.
+pub fn for_observer(out: Out) -> Option<Out> {
+    let Out::Plain(text) = out else {
+        return Some(out);
+    };
+    let kind = text
+        .strip_prefix('[')?
+        .split([',', ']'])
+        .next()?
+        .parse::<u8>()
+        .ok()?;
+    // the index of the list of rows in the array
+    let rows = match kind {
+        server::NAMES | server::QUEST_ROSTER => return None,
+        server::PROGRESS => 4,
+        server::QUEST_BOARD => 1,
+        server::PODIUM => {
+            let mut v: Value = serde_json::from_str(&text).ok()?;
+            let top = v.get(1)?.clone();
+            *v.get_mut(2)? = top;
+            return Some(Out::Plain(Utf8Bytes::from(v.to_string())));
+        }
+        _ => return Some(Out::Plain(text)),
+    };
+    let mut v: Value = serde_json::from_str(&text).ok()?;
+    for row in v.get_mut(rows)?.as_array_mut()? {
+        if let Some(name) = row.get_mut(0) {
+            *name = Value::String(String::new());
+        }
+    }
+    Some(Out::Plain(Utf8Bytes::from(v.to_string())))
+}
+
 /// `[0,now]`: no game in this session.
 pub fn none(now: i64) -> Utf8Bytes {
     Utf8Bytes::from(format!("[{},{now}]", server::NONE))

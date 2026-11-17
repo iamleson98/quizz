@@ -6,6 +6,7 @@ use crate::auth::Role;
 use crate::game::frames::ClientFrame;
 use crate::game::room::{EMPTY_ROOM_LIMIT, HOST_AWAY_LIMIT, ROOM_CLOSE_GRACE};
 use crate::game::store::LoadedQuiz;
+use crate::game::tests::watcher;
 use crate::game::tests::{
     BASE, CLOSED, Client, World, adv, connect, connect_rc, ended_reason, kind, last_of, leave,
     nothing_left, secs, settle, world_with,
@@ -1569,4 +1570,23 @@ async fn a_quest_whose_last_write_failed_is_written_once_the_database_is_back() 
     assert_eq!(ended_writes(&q), 1, "written later, once");
     h.frames();
     ps[0].frames();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watcher_of_a_running_quest_gets_the_board_without_names_and_no_roster() {
+    let q = Quest::new();
+    let h = q.host().await;
+    let _p = q.player(1).await;
+    start(&h, 300, 0).await;
+    settle().await;
+    adv(Duration::from_millis(600)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    let mut o = watcher(&q.w).await;
+    adv(Duration::from_secs(1)).await;
+    let f = o.frames();
+    assert_eq!(kind(&f[0]), 22, "the running state first: {f:?}");
+    assert!(last_of(&f, 21).is_none(), "no roster");
+    let board = last_of(&f, 29).expect("the live board");
+    assert_eq!(board[1][0][0], json!(""), "no name on the board");
 }

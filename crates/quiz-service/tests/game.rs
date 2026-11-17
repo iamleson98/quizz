@@ -880,3 +880,69 @@ async fn the_biggest_host_frames_fit_a_socket() {
         }
     }
 }
+
+// ------------------------------------------------------------------ watchers
+
+/// Open `GET /internal/sessions/{sid}/watch` on the internal listener.
+async fn watch(
+    s: &Service,
+    sid: &str,
+    key: Option<&str>,
+) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
+    let internal = quiz_service::server::internal_router(
+        s.state.clone(),
+        quiz_service::telemetry::init_metrics(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, internal).await });
+    let mut req = format!("ws://{addr}/internal/sessions/{sid}/watch")
+        .into_client_request()
+        .unwrap();
+    if let Some(key) = key {
+        req.headers_mut()
+            .insert("x-internal-key", HeaderValue::from_str(key).unwrap());
+    }
+    tokio_tungstenite::connect_async(req)
+        .await
+        .map(|(ws, _)| ws)
+}
+
+fn status_of(e: tokio_tungstenite::tungstenite::Error) -> u16 {
+    match e {
+        tokio_tungstenite::tungstenite::Error::Http(r) => r.status().as_u16(),
+        other => panic!("expected an HTTP refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_watcher_needs_the_internal_key_and_a_room_and_is_read_only() {
+    let s = serve(&[]).await;
+    let (mut host, _) = s.join(&host_ticket(&s, "teacher1")).await;
+
+    assert_eq!(status_of(watch(&s, "s1", None).await.unwrap_err()), 401);
+    assert_eq!(
+        status_of(watch(&s, "s1", Some("wrong")).await.unwrap_err()),
+        401
+    );
+    assert_eq!(
+        status_of(watch(&s, "nobody", Some(INTERNAL_KEY)).await.unwrap_err()),
+        404,
+        "no room, nothing to watch"
+    );
+
+    let mut w = watch(&s, "s1", Some(INTERNAL_KEY)).await.expect("upgrade");
+    assert_eq!(recv(&mut w).await[0], json!(0), "the current state first");
+    // it sends nothing: a command is refused by closing the socket
+    send(&mut w, json!([1, "1"])).await;
+    assert_eq!(
+        close_of(&mut w).await,
+        Some((1008, "read only".to_string()))
+    );
+    assert!(
+        s.state.rooms.has_room("s1"),
+        "the room is the host's, not the watcher's"
+    );
+    drop(host.close(None).await);
+    settled(&s).await;
+}

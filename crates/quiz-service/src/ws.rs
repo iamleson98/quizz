@@ -12,7 +12,7 @@ use crate::game::registry::{Turned, UnknownGuard, out_channel};
 use crate::game::room::{Member, ROOM_CLOSE_GRACE};
 use crate::state::AppState;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, FromRequestParts, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
 use axum::http::header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
@@ -289,6 +289,94 @@ async fn serve(state: AppState, mut socket: WebSocket, unknown: UnknownGuard) {
             }
             _ = conn.evicted() => {
                 close(&mut socket, 1008, "replaced by a newer socket").await;
+                break;
+            }
+        }
+    }
+    room.detach(sock).await;
+}
+
+/// Longest session id accepted in the watch path.
+const MAX_SID_BYTES: usize = 128;
+
+/// `GET /internal/sessions/{sid}/watch` on the internal listener: a read-only
+/// watcher of a session's room for the recording server. It carries the
+/// internal key, needs no ticket and no `Origin`, and gets a 404 while the
+/// session has no room (the caller retries). It is sent what a host is sent,
+/// less the names (see `frames::for_observer`); anything it sends is refused by
+/// closing the socket.
+pub async fn watch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(e) = crate::server::check_internal_key(&state, &headers) {
+        return e.into_response();
+    }
+    if sid.is_empty() || sid.len() > MAX_SID_BYTES {
+        return AppError::BadRequest("not a session id".into()).into_response();
+    }
+    if !state.rooms.has_room(&sid) {
+        return AppError::NotFound("room".into()).into_response();
+    }
+    ws.max_message_size(MAX_FRAME_BYTES)
+        .max_frame_size(MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| serve_watcher(state, socket, sid))
+}
+
+async fn serve_watcher(state: AppState, mut socket: WebSocket, sid: String) {
+    let sock = state.rooms.next_sock_id();
+    let (out_tx, mut out_rx) = out_channel();
+    let room = match state.rooms.observe(&sid, sock, out_tx).await {
+        Ok(room) => room,
+        Err(_) => {
+            close(&mut socket, 1013, "no room").await;
+            return;
+        }
+    };
+    let mut ping = tokio::time::interval_at(
+        Instant::now() + state.cfg.ws_ping_every,
+        state.cfg.ws_ping_every,
+    );
+    let mut pong_deadline: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => pong_deadline = None,
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                // a watcher sends nothing
+                Some(Ok(_)) => {
+                    close(&mut socket, 1008, "read only").await;
+                    break;
+                }
+            },
+            out = out_rx.recv() => match out {
+                Some(Out::Close(code, reason)) => {
+                    close(&mut socket, code, reason).await;
+                    break;
+                }
+                Some(out) => {
+                    if let Some(text) = out.into_text()
+                        && !send(&mut socket, text).await
+                    {
+                        break;
+                    }
+                }
+                // the room ended
+                None => {
+                    close(&mut socket, 1001, "room closed").await;
+                    break;
+                }
+            },
+            _ = ping.tick() => {
+                if !send_message(&mut socket, Message::Ping(Default::default())).await {
+                    break;
+                }
+                pong_deadline.get_or_insert(Instant::now() + state.cfg.ws_pong_within);
+            }
+            _ = sleep_until_opt(pong_deadline) => {
+                close(&mut socket, 1008, "no pong").await;
                 break;
             }
         }

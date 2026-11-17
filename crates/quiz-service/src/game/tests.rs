@@ -1940,3 +1940,152 @@ async fn the_connected_players_gauge_follows_every_way_a_socket_leaves() {
     nothing_left(&w);
     drop((h, b, c, d));
 }
+
+// ------------------------------------------------------------------ watchers
+
+/// A read-only watcher of the room of `s1`.
+pub(crate) async fn watcher(w: &World) -> Client {
+    let (out, rx) = super::registry::out_channel();
+    let sock = w.deps.rooms.next_sock_id();
+    let room = w
+        .deps
+        .rooms
+        .observe("s1", sock, out)
+        .await
+        .expect("watching");
+    settle().await;
+    Client { sock, room, rx }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watcher_sees_what_the_host_sees_without_names_and_starts_from_the_state() {
+    let w = world();
+    let p1 = player(&w, 1).await;
+    let _p2 = player(&w, 2).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    answer(&p1, 1, 0b0010).await;
+    settle().await;
+
+    // joining in the middle of a question: its frame first, then the live
+    // selections, with the ranking's names blanked; no names frame
+    let mut o = watcher(&w).await;
+    let f = o.frames();
+    assert_eq!(kind(&f[0]), 2, "the state is the first frame: {f:?}");
+    let progress = last_of(&f, 4).expect("the live selections");
+    assert_eq!(progress[3], json!([0, 1, 0, 0]));
+    assert_eq!(progress[4][0][0], json!(""), "no name in the ranking");
+    assert_ne!(progress[4][0][1], json!(0), "the score stays");
+    assert!(last_of(&f, 10).is_none());
+
+    // the reveal goes to it as to the host, names kept for the scoreboard
+    h.send(ClientFrame::Next).await;
+    settle().await;
+    beat().await;
+    let f = o.frames();
+    assert_eq!(last_of(&f, 11).unwrap(), &json!([11, 1]));
+    let reveal = last_of(&f, 5).expect("reveal");
+    assert_eq!(reveal.as_array().unwrap().len(), 6, "no personal tail");
+    assert_eq!(reveal[5][0][0], json!("name-p1"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watcher_takes_no_seat_and_the_room_ends_as_if_it_were_not_there() {
+    let w = world();
+    let p = player(&w, 1).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    let mut o = watcher(&w).await;
+    o.frames();
+    // not a player: not counted, and a lobby count does not include it
+    assert_eq!(w.deps.rooms.counts().running_games, 1);
+
+    // the host leaves: the watcher is not a host, the 2 minutes still run out
+    leave(&h).await;
+    adv(HOST_AWAY_LIMIT + secs(1)).await;
+    let t = o.trace();
+    assert_eq!(ended_reason(&t).as_deref(), Some("4"), "{t:?}");
+    leave(&p).await;
+    adv(secs(1)).await;
+    nothing_left(&w);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watcher_is_not_somebody_connected_for_the_idle_end() {
+    let w = world();
+    let p = player(&w, 1).await;
+    let h = host(&w).await;
+    h.send(ClientFrame::Start(1)).await;
+    settle().await;
+    let mut o = watcher(&w).await;
+    leave(&p).await;
+    leave(&h).await;
+    adv(EMPTY_ROOM_LIMIT + secs(1)).await;
+    let t = o.trace();
+    assert_eq!(ended_reason(&t).as_deref(), Some("2"), "{t:?}");
+    nothing_left(&w);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watcher_cannot_command_and_a_room_has_few_of_them() {
+    let w = world();
+    let _h = host(&w).await;
+    let mut o = watcher(&w).await;
+    o.frames();
+    // a frame from a socket the room does not know as a member is ignored
+    o.send(ClientFrame::Start(1)).await;
+    settle().await;
+    assert!(o.frames().is_empty());
+    assert_eq!(w.deps.rooms.counts().running_games, 0, "no game was opened");
+
+    let mut more = Vec::new();
+    for _ in 1..super::room::MAX_OBSERVERS {
+        more.push(watcher(&w).await);
+    }
+    let (out, _rx) = super::registry::out_channel();
+    let sock = w.deps.rooms.next_sock_id();
+    assert!(w.deps.rooms.observe("s1", sock, out).await.is_err());
+    assert!(
+        w.deps
+            .rooms
+            .observe("nobody", sock, super::registry::out_channel().0)
+            .await
+            .is_err()
+    );
+}
+
+fn observed(frame: &str) -> Option<String> {
+    use axum::extract::ws::Utf8Bytes;
+    super::frames::for_observer(Out::Plain(Utf8Bytes::from(frame.to_string())))
+        .and_then(Out::into_text)
+        .map(|t| t.to_string())
+}
+
+#[test]
+fn a_watcher_never_gets_a_name_only_the_host_sees() {
+    // lists of names: nothing
+    assert_eq!(observed(r#"[10,["Ann","Bo"]]"#), None);
+    assert_eq!(observed(r#"[21,[["Ann",1]]]"#), None);
+    // the ranking and the quest board: names blanked, the rest kept
+    assert_eq!(
+        observed(r#"[4,1,2,[1,0],[["Ann",900],["Bo",5]]]"#).as_deref(),
+        Some(r#"[4,1,2,[1,0],[["",900],["",5]]]"#)
+    );
+    assert_eq!(
+        observed(r#"[29,[["Ann",2,40]],3,4,1,5000]"#).as_deref(),
+        Some(r#"[29,[["",2,40]],3,4,1,5000]"#)
+    );
+    // the podium: the top three twice, never the full order
+    assert_eq!(
+        observed(r#"[6,[["A",9],["B",8],["C",7]],[["A",9],["B",8],["C",7],["D",6],["E",5]]]"#)
+            .as_deref(),
+        Some(r#"[6,[["A",9],["B",8],["C",7]],[["A",9],["B",8],["C",7]]]"#)
+    );
+    // a reveal (the host's form: top five, no tail) and the rest pass as they are
+    let reveal = r#"[5,1,2,[1,1,0,0],null,[["A",9]]]"#;
+    assert_eq!(observed(reveal).as_deref(), Some(reveal));
+    assert_eq!(observed("[11,1]").as_deref(), Some("[11,1]"));
+}
