@@ -44,4 +44,4 @@ utoipa = "6.0.0"
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = "0.1.5"
 tower = { version = "0.5.3", features = ["util"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
