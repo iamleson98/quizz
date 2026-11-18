@@ -20,9 +20,9 @@
 # (cargo build --release -p bench) and is not in the image.
 
 # ────────────────────────────── Builder ──────────────────────────────
-# The latest stable Rust when this was written; raise it with --build-arg RUST_VERSION=...
-ARG RUST_VERSION=1.99.1
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-trixie AS builder
+# The latest stable Rust when this was written, pinned by digest (dependabot moves tag and digest
+# together).
+FROM --platform=$BUILDPLATFORM rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07 AS builder
 ARG BUILDARCH
 ARG TARGETARCH
 

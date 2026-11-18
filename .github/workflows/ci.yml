@@ -1,7 +1,7 @@
 name: ci
 
 # Formatting, lints, the test suite and a dependency audit. Every cargo command uses --locked.
-# The toolchain is the Rust version of the Dockerfile (ARG RUST_VERSION), so the checks and the
+# The toolchain is the Rust version of the Dockerfile (the pinned rust: image in its FROM line), so the checks and the
 # image are built by the same compiler. SQLite's begin-concurrent branch is built first
 # (scripts/build-sqlite.sh): .cargo/config.toml links the service against it.
 
@@ -38,7 +38,7 @@ jobs:
       - name: Toolchain
         run: |
           set -euo pipefail
-          version="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)"
+          version="$(sed -n 's/^FROM .* rust:\([0-9.]*\)-.*/\1/p' Dockerfile)"
           rustup toolchain install "${version}" --profile minimal --component rustfmt --component clippy
           rustup default "${version}"
       - name: SQLite
@@ -60,7 +60,7 @@ jobs:
       - name: Toolchain
         run: |
           set -euo pipefail
-          version="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)"
+          version="$(sed -n 's/^FROM .* rust:\([0-9.]*\)-.*/\1/p' Dockerfile)"
           rustup toolchain install "${version}" --profile minimal
           rustup default "${version}"
       - name: SQLite
@@ -81,7 +81,7 @@ jobs:
       - name: Toolchain
         run: |
           set -euo pipefail
-          version="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)"
+          version="$(sed -n 's/^FROM .* rust:\([0-9.]*\)-.*/\1/p' Dockerfile)"
           rustup toolchain install "${version}" --profile minimal
           rustup default "${version}"
       - run: cargo install cargo-audit --locked --version 0.22.2
