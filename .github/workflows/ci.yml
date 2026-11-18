@@ -1,0 +1,88 @@
+name: ci
+
+# Formatting, lints, the test suite and a dependency audit. Every cargo command uses --locked.
+# The toolchain is the Rust version of the Dockerfile (ARG RUST_VERSION), so the checks and the
+# image are built by the same compiler. SQLite's begin-concurrent branch is built first
+# (scripts/build-sqlite.sh): .cargo/config.toml links the service against it.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # image.yml runs the whole suite as the gate of a release.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Not ${{ github.workflow }}: called from image.yml that is the caller's name, which is also
+  # the start of the caller's own concurrency group.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  check:
+    name: Format and lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)"
+          rustup toolchain install "${version}" --profile minimal --component rustfmt --component clippy
+          rustup default "${version}"
+      - name: SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tcl
+          ./scripts/build-sqlite.sh
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)"
+          rustup toolchain install "${version}" --profile minimal
+          rustup default "${version}"
+      - name: SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tcl
+          ./scripts/build-sqlite.sh
+      - run: cargo test --workspace --locked --no-fail-fast
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)"
+          rustup toolchain install "${version}" --profile minimal
+          rustup default "${version}"
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: cargo audit --deny warnings
