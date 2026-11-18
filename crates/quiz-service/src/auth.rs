@@ -143,12 +143,11 @@ impl Ticket {
             iat: now_secs,
             exp,
         };
-        encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &EncodingKey::from_secret(key.expose().as_bytes()),
-        )
-        .map_err(|e| AppError::Internal(format!("ticket signing failed: {e}")))
+        let sign_err = |e: jsonwebtoken::errors::Error| {
+            AppError::Internal(format!("ticket signing failed: {e}"))
+        };
+        let key = EncodingKey::from_secret(key.expose().as_bytes()).map_err(sign_err)?;
+        encode(&Header::new(Algorithm::HS256), &claims, &key).map_err(sign_err)
     }
 
     /// The bank (quizzes of one's own): teachers and hosts.
@@ -226,7 +225,7 @@ mod tests {
     }
 
     fn dkey() -> DecodingKey {
-        DecodingKey::from_secret(KEY.as_bytes())
+        DecodingKey::from_secret(KEY.as_bytes()).unwrap()
     }
 
     fn host() -> Ticket {
@@ -256,11 +255,11 @@ mod tests {
         assert!(Ticket::verify(&dkey(), &expired).is_err());
 
         let token = host().sign(&secret(), now(), now() + 600).unwrap();
-        let other = DecodingKey::from_secret(b"another-key-another-key-another-key");
+        let other = DecodingKey::from_secret(b"another-key-another-key-another-key").unwrap();
         assert!(Ticket::verify(&other, &token).is_err());
 
         // hand-made tokens that break one rule each
-        let enc = EncodingKey::from_secret(KEY.as_bytes());
+        let enc = EncodingKey::from_secret(KEY.as_bytes()).unwrap();
         let base = serde_json::json!({
             "iss": "lms", "aud": "quiz", "sub": "u1", "name": "n", "role": "host",
             "sid": "s", "cid": "c", "rc": 4_000_000_000_000_i64, "exp": now() + 600

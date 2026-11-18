@@ -8,7 +8,7 @@ use crate::error::{AppError, AppResult, FieldError};
 use crate::ids::new_id;
 use crate::model::{OptionRow, QuestionKind, QuestionRow, QuestionWithOptions, QuizRow};
 use crate::retention::quiz_expiry;
-use sqlx::{Executor, Sqlite, SqliteConnection};
+use sqlx::{AssertSqlSafe, Executor, Sqlite, SqliteConnection};
 use std::collections::{HashMap, HashSet};
 
 /// Limits of the bank, enforced on every save.
@@ -486,9 +486,10 @@ pub async fn owned<'e, E>(exec: E, quiz_id: i64, owner_id: &str) -> AppResult<Qu
 where
     E: 'e + Send + Executor<'e, Database = Sqlite>,
 {
-    sqlx::query_as::<_, QuizRow>(&format!(
+    // SQL safety: only the QUIZ_COLS constant is interpolated; the values are bound.
+    sqlx::query_as::<_, QuizRow>(AssertSqlSafe(format!(
         "SELECT {QUIZ_COLS} FROM quizzes WHERE id = ?1 AND owner_id = ?2"
-    ))
+    )))
     .bind(quiz_id)
     .bind(owner_id)
     .fetch_optional(exec)
@@ -506,10 +507,11 @@ pub async fn page<'e, E>(
 where
     E: 'e + Send + Clone + Executor<'e, Database = Sqlite>,
 {
-    let rows = sqlx::query_as::<_, QuizRow>(&format!(
+    let rows = // SQL safety: only the QUIZ_COLS constant is interpolated; the values are bound.
+    sqlx::query_as::<_, QuizRow>(AssertSqlSafe(format!(
         "SELECT {QUIZ_COLS} FROM quizzes WHERE owner_id = ?1
          ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3"
-    ))
+    )))
     .bind(owner_id)
     .bind(limit)
     .bind(offset)
@@ -563,10 +565,11 @@ where
     let mut out = HashMap::new();
     for chunk in quiz_ids.chunks(500) {
         let marks = vec!["?"; chunk.len()].join(",");
-        let sql = format!(
+        // SQL safety: `marks` is only `?` placeholders, one per bound id.
+        let sql = AssertSqlSafe(format!(
             "SELECT quiz_id, COUNT(*) FROM questions WHERE quiz_id IN ({marks}) GROUP BY quiz_id"
-        );
-        let mut q = sqlx::query_as::<_, (i64, i64)>(&sql);
+        ));
+        let mut q = sqlx::query_as::<_, (i64, i64)>(sql);
         for id in chunk {
             q = q.bind(id);
         }
