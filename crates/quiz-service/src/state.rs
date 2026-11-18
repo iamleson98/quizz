@@ -48,8 +48,10 @@ impl AppState {
         let (pool, sqlite_version) = crate::db::connect_pool(&cfg).await?;
         let write_limiter =
             crate::ratelimit::Limiter::new(cfg.bank_write_burst, cfg.bank_writes_per_minute);
+        let ticket_key = DecodingKey::from_secret(cfg.ticket_key.expose().as_bytes())
+            .map_err(|e| crate::error::AppError::Internal(format!("ticket key: {e}")))?;
         let state = Self(Arc::new(AppStateInner {
-            ticket_key: DecodingKey::from_secret(cfg.ticket_key.expose().as_bytes()),
+            ticket_key,
             cfg,
             pool,
             commit_mutex: Mutex::new(()),
